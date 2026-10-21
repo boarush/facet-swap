@@ -11,8 +11,6 @@ type WaitingRequest = {
 };
 
 // This class stays stable; only the app facet's code is versioned.
-
-
 export class Supervisor extends DurableObject<Env> {
   private state: VersionState;
   private inflight = 0;
@@ -100,4 +98,3 @@ export class Supervisor extends DurableObject<Env> {
     }
   }
 }
-
