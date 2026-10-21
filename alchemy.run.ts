@@ -4,7 +4,6 @@ import * as Cloudflare from "alchemy/Cloudflare";
 import { localState } from "alchemy/State";
 import * as Effect from "effect/Effect";
 
-
 export default Alchemy.Stack("FacetSwap", {
   providers: Cloudflare.providers(),
   state: localState(),
