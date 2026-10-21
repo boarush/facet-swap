@@ -6,7 +6,18 @@
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["@cloudflare/workers-types"]
+    "types": ["@cloudflare/workers-types"],
+    "plugins": [
+      {
+        "name": "@effect/language-service"
+      }
+    ]
   },
-  "include": ["src/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "infra/**/*.ts",
+    "alchemy.run.ts",
+    "facet-version.ts",
+    "vitest.config.ts"
+  ]
 }

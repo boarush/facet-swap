@@ -66,3 +66,17 @@ Run `npm run lint` for Oxlint correctness rules and import-boundary checks.
 `npm run fmt` formats the project with Oxfmt; `npm run fmt:check` checks without
 writing. Both tools ignore local emulator data and audit output. The formatter
 also ignores the generated version input and npm's lockfile.
+
+Effect's `@effect/language-service` plugin is enabled in `tsconfig.json`.
+The `prepare` hook patches the local TypeScript compiler after installation,
+so `npm run check` reports Effect diagnostics for the runtime, stack, and
+infrastructure as well as ordinary type errors. This project uses TypeScript 6;
+TypeScript 7 requires the separate `@effect/tsgo` integration instead.
+Select the workspace TypeScript version in your editor to get the same plugin.
+The TypeScript and import-boundary checks are deliberately separate from formatting.
+
+Tool setup follows https://oxc.rs/docs/guide/usage/linter/config ,
+https://oxc.rs/docs/guide/usage/formatter/config , and
+https://github.com/Effect-TS/language-service . The native Alchemy Vitest adapter
+was verified against the installed beta.83 implementation in
+`alchemy/src/Test/Vitest.ts`, including its cleanup hooks.
