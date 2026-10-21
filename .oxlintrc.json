@@ -1,0 +1,52 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc"],
+  "categories": { "correctness": "error" },
+  "ignorePatterns": [".alchemy/**", "audit.json"],
+  "overrides": [
+    {
+      "files": ["src/**/*.ts", "infra/**/*.ts", "alchemy.run.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["**/scripts", "**/scripts/**", "**/test", "**/test/**"],
+                "message": "Runtime and infrastructure must not import CLI entrypoints or tests."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/**/*.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": [
+                  "**/scripts",
+                  "**/scripts/**",
+                  "**/test",
+                  "**/test/**",
+                  "**/infra",
+                  "**/infra/**"
+                ],
+                "message": "Worker runtime cannot import infrastructure, CLI entrypoints or tests."
+              },
+              {
+                "group": ["**/alchemy.run"],
+                "allowTypeImports": true,
+                "message": "Stack imports must be type-only so infrastructure stays out of Worker bundles."
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

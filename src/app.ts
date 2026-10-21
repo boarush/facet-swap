@@ -16,8 +16,12 @@ export class App extends DurableObject<{ HASH: string }> {
     const count = Number(url.searchParams.get("n") ?? 10);
     const intervalMs = Number(url.searchParams.get("ms") ?? 500);
     if (
-      !Number.isInteger(count) || count < 1 || count > 10000 ||
-      !Number.isFinite(intervalMs) || intervalMs < 0 || intervalMs > 10000
+      !Number.isInteger(count) ||
+      count < 1 ||
+      count > 10000 ||
+      !Number.isFinite(intervalMs) ||
+      intervalMs < 0 ||
+      intervalMs > 10000
     ) {
       return new Response("Invalid n/ms", { status: 400 });
     }
@@ -34,9 +38,9 @@ export class App extends DurableObject<{ HASH: string }> {
     const encoder = new TextEncoder();
 
     const body = new ReadableStream<Uint8Array>({
-      pull: async controller => {
+      pull: async (controller) => {
         if (seq > 0 && intervalMs > 0) {
-          await new Promise<void>(resolve => {
+          await new Promise<void>((resolve) => {
             wake = resolve;
             timer = setTimeout(resolve, intervalMs);
           });
@@ -51,9 +55,9 @@ export class App extends DurableObject<{ HASH: string }> {
           msg: "hello from " + VERSION,
           served,
         };
-        controller.enqueue(encoder.encode(
-          "id: " + seq + "\ndata: " + JSON.stringify(event) + "\n\n",
-        ));
+        controller.enqueue(
+          encoder.encode("id: " + seq + "\ndata: " + JSON.stringify(event) + "\n\n"),
+        );
         if (seq === count) controller.close();
       },
       cancel: () => {

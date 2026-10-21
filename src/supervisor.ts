@@ -43,7 +43,7 @@ export class Supervisor extends DurableObject<Env> {
   }
 
   private checkForUpdate(): Promise<void> {
-    return this.versions.check(latest => {
+    return this.versions.check((latest) => {
       if (latest && latest !== this.state.current && latest !== this.state.pending) {
         this.state.pending = latest;
         this.ctx.storage.kv.put("versions", this.state);

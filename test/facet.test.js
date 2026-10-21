@@ -6,7 +6,7 @@ import * as Cloudflare from "alchemy/Cloudflare";
 import * as Effect from "effect/Effect";
 import { resources } from "../alchemy.run.ts";
 
-const port = await new Promise(resolve => {
+const port = await new Promise((resolve) => {
   const server = createServer();
   server.listen(0, "127.0.0.1", () => {
     const port = server.address().port;
@@ -16,8 +16,11 @@ const port = await new Promise(resolve => {
 const base = "http://127.0.0.1:" + port;
 process.env.PORT = String(port);
 process.env.CHECK_INTERVAL_MS = "0";
-const { test } = Test.make({ providers: Cloudflare.providers(), dev: true,
-  stage: "test_" + process.pid });
+const { test } = Test.make({
+  providers: Cloudflare.providers(),
+  dev: true,
+  stage: "test_" + process.pid,
+});
 async function get(path) {
   const response = await fetch(base + path);
   assert.equal(response.status, 200, await response.clone().text());
@@ -33,7 +36,9 @@ async function until(fn) {
 }
 function stream(user, n, ms) {
   let first;
-  const started = new Promise(resolve => { first = resolve; });
+  const started = new Promise((resolve) => {
+    first = resolve;
+  });
   const done = (async () => {
     const response = await fetch(base + "/u/" + user + "/stream?n=" + n + "&ms=" + ms);
     assert.equal(response.status, 200);
@@ -46,7 +51,7 @@ function stream(user, n, ms) {
       while ((index = buffered.indexOf("\n\n")) !== -1) {
         const frame = buffered.slice(0, index);
         buffered = buffered.slice(index + 2);
-        const data = frame.split("\n").find(line => line.startsWith("data: "));
+        const data = frame.split("\n").find((line) => line.startsWith("data: "));
         if (data) {
           const event = JSON.parse(data.slice(6));
           assert.equal(frame.split("\n")[0], "id: " + event.seq);
@@ -56,82 +61,106 @@ function stream(user, n, ms) {
       }
     }
     assert.equal(events.length, n);
-    assert.deepEqual(events.map(e => e.seq), Array.from({ length: n }, (_, i) => i + 1));
+    assert.deepEqual(
+      events.map((e) => e.seq),
+      Array.from({ length: n }, (_, i) => i + 1),
+    );
     return events;
   })();
   // Surface startup errors to both consumers.
-  done.catch(error => first(Promise.reject(error)));
+  done.catch((error) => first(Promise.reject(error)));
   return { started, done };
 }
-const pass = message => console.log("PASS " + message);
-test.provider("facet swap", stack => Effect.gen(function* () {
-  const context = yield* Effect.context();
-  const deploy = async version => {
-    const result = await Effect.runPromise(stack.deploy(resources(version)).pipe(Effect.provideContext(context)));
-    return result.published.hash;
-  };
-  yield* Effect.tryPromise(async () => {
-  const a = "alice_" + process.pid;
-  const b = "bob_" + process.pid;
-  const v1 = await deploy("v1");
-  const before = await get("/__local/publication");
-  const repeated = await deploy("v1");
-  assert.equal(repeated, v1);
-  assert.deepEqual(await get("/__local/publication"), before);
-  pass("unchanged stack redeploy skips R2 upload and KV latest write");
-  assert.equal((await fetch(base + "/__local/code", { method: "PUT", body: "bad" })).status, 404);
-  assert.equal((await fetch(base + "/__local/latest", { method: "PUT", body: v1 })).status, 404);
-  pass("old code-execution publication endpoints are removed");
-  assert.equal((await get("/u/" + b + "/version")).hash, v1);
-  const old = stream(a, 25, 100);
-  assert.equal((await old.started).v, "v1");
-  const v2 = await deploy("v2");
-  assert.notEqual(v2, v1);
-  const updated = await get("/__local/publication");
-  assert.equal(updated.hash, v2);
-  assert.equal(updated.metadata.version, "v2");
-  assert.notEqual(updated.metadata.publication, before.metadata.publication);
-  assert.notEqual(updated.uploaded, before.uploaded);
-  let queuedResolved = false;
-  const queued = get("/u/" + a + "/version").then(value => { queuedResolved = true; return value; });
-  await until(async () => {
-    const status = await get("/u/" + a + "/__status");
-    return status.pending === v2 && status.queued === 1 && status.inflight === 1;
-  });
-  assert.equal(queuedResolved, false);
-  pass("request during drain is queued, active stream still counted");
-  const bob = await get("/u/" + b + "/version");
-  assert.equal(bob.hash, v2);
-  assert.equal(bob.served, 0);
-  assert.equal(queuedResolved, false);
-  pass("another user's supervisor updates independently during Alice's drain");
-  const oldEvents = await old.done;
-  assert(oldEvents.every(event => event.v === "v1" && event.hash === v1));
-  pass("all 25 SSE events finish on v1, without truncation or mixed versions");
-  const after = await queued;
-  assert.equal(after.hash, v2);
-  assert.equal(after.served, 1);
-  pass("queued request resumes on v2 and facet SQLite counter survives abort");
-  const fresh = stream(a, 3, 10);
-  const freshEvents = await fresh.done;
-  assert(freshEvents.every(event => event.v === "v2" && event.hash === v2 && event.served === 2));
-  pass("fresh SSE stream is entirely v2, counter increments to 2");
+const pass = (message) => console.log("PASS " + message);
+test.provider(
+  "facet swap",
+  (stack) =>
+    Effect.gen(function* () {
+      const context = yield* Effect.context();
+      const deploy = async (version) => {
+        const result = await Effect.runPromise(
+          stack.deploy(resources(version)).pipe(Effect.provideContext(context)),
+        );
+        return result.published.hash;
+      };
+      yield* Effect.tryPromise(async () => {
+        const a = "alice_" + process.pid;
+        const b = "bob_" + process.pid;
+        const v1 = await deploy("v1");
+        const before = await get("/__local/publication");
+        const repeated = await deploy("v1");
+        assert.equal(repeated, v1);
+        assert.deepEqual(await get("/__local/publication"), before);
+        pass("unchanged stack redeploy skips R2 upload and KV latest write");
+        assert.equal(
+          (await fetch(base + "/__local/code", { method: "PUT", body: "bad" })).status,
+          404,
+        );
+        assert.equal(
+          (await fetch(base + "/__local/latest", { method: "PUT", body: v1 })).status,
+          404,
+        );
+        pass("old code-execution publication endpoints are removed");
+        assert.equal((await get("/u/" + b + "/version")).hash, v1);
+        const old = stream(a, 25, 100);
+        assert.equal((await old.started).v, "v1");
+        const v2 = await deploy("v2");
+        assert.notEqual(v2, v1);
+        const updated = await get("/__local/publication");
+        assert.equal(updated.hash, v2);
+        assert.equal(updated.metadata.version, "v2");
+        assert.notEqual(updated.metadata.publication, before.metadata.publication);
+        assert.notEqual(updated.uploaded, before.uploaded);
+        let queuedResolved = false;
+        const queued = get("/u/" + a + "/version").then((value) => {
+          queuedResolved = true;
+          return value;
+        });
+        await until(async () => {
+          const status = await get("/u/" + a + "/__status");
+          return status.pending === v2 && status.queued === 1 && status.inflight === 1;
+        });
+        assert.equal(queuedResolved, false);
+        pass("request during drain is queued, active stream still counted");
+        const bob = await get("/u/" + b + "/version");
+        assert.equal(bob.hash, v2);
+        assert.equal(bob.served, 0);
+        assert.equal(queuedResolved, false);
+        pass("another user's supervisor updates independently during Alice's drain");
+        const oldEvents = await old.done;
+        assert(oldEvents.every((event) => event.v === "v1" && event.hash === v1));
+        pass("all 25 SSE events finish on v1, without truncation or mixed versions");
+        const after = await queued;
+        assert.equal(after.hash, v2);
+        assert.equal(after.served, 1);
+        pass("queued request resumes on v2 and facet SQLite counter survives abort");
+        const fresh = stream(a, 3, 10);
+        const freshEvents = await fresh.done;
+        assert(
+          freshEvents.every((event) => event.v === "v2" && event.hash === v2 && event.served === 2),
+        );
+        pass("fresh SSE stream is entirely v2, counter increments to 2");
 
-  // A cancelled body must also release the drain gate.
-  const aborter = new AbortController();
-  const response = await fetch(base + "/u/" + a + "/stream?n=100&ms=100", { signal: aborter.signal });
-  const reader = response.body.getReader();
-  await reader.read();
-  const v3 = await deploy("v3");
-  const cancelledQueue = get("/u/" + a + "/version");
-  await until(async () => (await get("/u/" + a + "/__status")).queued === 1);
-  aborter.abort();
-  try { await reader.cancel(); } catch {}
-  const afterCancel = await cancelledQueue;
-  assert.equal(afterCancel.hash, v3);
-  assert.equal(afterCancel.served, 3);
-  pass("client cancellation releases inflight, allows pending v3 swap, preserves SQLite");
-  console.log("ALL PASS");
-
-  });
-}), { timeout: 90000 });
+        // A cancelled body must also release the drain gate.
+        const aborter = new AbortController();
+        const response = await fetch(base + "/u/" + a + "/stream?n=100&ms=100", {
+          signal: aborter.signal,
+        });
+        const reader = response.body.getReader();
+        await reader.read();
+        const v3 = await deploy("v3");
+        const cancelledQueue = get("/u/" + a + "/version");
+        await until(async () => (await get("/u/" + a + "/__status")).queued === 1);
+        aborter.abort();
+        try {
+          await reader.cancel();
+        } catch {}
+        const afterCancel = await cancelledQueue;
+        assert.equal(afterCancel.hash, v3);
+        assert.equal(afterCancel.served, 3);
+        pass("client cancellation releases inflight, allows pending v3 swap, preserves SQLite");
+        console.log("ALL PASS");
+      });
+    }),
+  { timeout: 90000 },
+);

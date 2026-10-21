@@ -15,7 +15,9 @@ export class VersionSource {
     this.lastCheck = Date.now();
     this.checking = this.env.VERSIONS.get("latest")
       .then(onLatest)
-      .finally(() => { this.checking = undefined; });
+      .finally(() => {
+        this.checking = undefined;
+      });
     return this.checking;
   }
 }

@@ -46,7 +46,6 @@ The installed beta.83 has no R2 object or KV value lifecycle resources, so these
 
 This is stack-driven publishing, not a separate facet source watcher. Changing `facet-version.ts` triggers reconciliation. After editing only facet source, run `npm run deploy -- <label>` to trigger another evaluation, or restart dev. Repeating the same label leaves the artifact hash unchanged unless the emitted code changed.
 
-
 Alchemy beta.83 already has a native WorkerLoader() binding and native local Worker Loader support. Its API calls the DO namespace declaration DurableObject(), rather than DurableObjectNamespace(). No raw binding passthrough, plain Wrangler fallback, or custom workerd launcher was needed.
 
 The one runtime workaround is an npm override. Alchemy beta.83's cloudflare-runtime pins workerd 1.20261002.1. This project pins and overrides it to 1.20261021.1 for current facets support, without modifying node_modules. The checked-in lockfile captures that exact tested runtime. npm did not have a beta dist-tag when checked; latest was 2.0.0-beta.83, while next pointed at older beta.72. The project pins beta.83 explicitly.
@@ -59,7 +58,11 @@ npm audit reports advisories in Alchemy's transitive dependencies, including Pri
 
 Reference documentation is at https://alchemy.run/environments/local-development and https://alchemy.run/cloudflare/compute/worker-loader and https://developers.cloudflare.com/dynamic-workers/usage/durable-object-facets/ . The installed Alchemy sources for Workers/WorkerLoader.ts, Workers/RuntimeBindings.ts, Workers/DurableObject.ts, R2/Bucket.ts, KV/Namespace.ts, and State/LocalState.ts were also checked.
 
-
 The publication implementation was checked against the installed `alchemy/src/Bundle/Bundle.ts`, `Action.ts`, `Cloudflare/R2/WriteBucketLocal.ts`, `Cloudflare/R2/LocalR2Gateway.ts`, `Cloudflare/KV/WriteNamespaceLocal.ts`, and `Cloudflare/KV/LocalKVGateway.ts`. The custom-provider lifecycle and local-provider routes were also checked before choosing the simpler Actions abstraction. References are https://alchemy.run/infrastructure-as-code/action/ , https://alchemy.run/infrastructure-as-code/custom-provider/ , https://alchemy.run/infrastructure-as-code/local-provider/ , and https://github.com/alchemy-run/alchemy/blob/main/packages/alchemy/src/Bundle/Bundle.ts .
 
 The layout keeps runtime and deployment separate. `src/` contains only Worker and facet runtime code; its stack dependency is type-only for inferred bindings. `infra/` contains bundling and publication Effects used by `alchemy.run.ts`. `scripts/` contains CLI entrypoints only and is never imported by runtime or stack code. `test/` contains integration tests. `facet-version.ts` is the manual stack input.
+
+Run `npm run lint` for Oxlint correctness rules and import-boundary checks.
+`npm run fmt` formats the project with Oxfmt; `npm run fmt:check` checks without
+writing. Both tools ignore local emulator data and audit output. The formatter
+also ignores the generated version input and npm's lockfile.

@@ -10,8 +10,9 @@ export function trackResponseBody(
   }
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   ctx.waitUntil(
-    response.body.pipeTo(writable)
-      .catch(error => {
+    response.body
+      .pipeTo(writable)
+      .catch((error) => {
         console.log("response body ended with error/cancellation", String(error));
       })
       .finally(release),
