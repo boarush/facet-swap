@@ -67,16 +67,54 @@ Run `npm run lint` for Oxlint correctness rules and import-boundary checks.
 writing. Both tools ignore local emulator data and audit output. The formatter
 also ignores the generated version input and npm's lockfile.
 
-Effect's `@effect/language-service` plugin is enabled in `tsconfig.json`.
-The `prepare` hook patches the local TypeScript compiler after installation,
-so `npm run check` reports Effect diagnostics for the runtime, stack, and
-infrastructure as well as ordinary type errors. This project uses TypeScript 6;
-TypeScript 7 requires the separate `@effect/tsgo` integration instead.
-Select the workspace TypeScript version in your editor to get the same plugin.
+Typechecking uses the native TypeScript 7 compiler (`typescript@7.0.2`). Its
+package still exposes the `tsc` command, so `npm run check` runs TS7, not the
+legacy JavaScript compiler. `@effect/tsgo` supplies Effect diagnostics; the
+`prepare` hook runs `effect-tsgo patch` after installation. The plugin name in
+`tsconfig.json` remains `@effect/language-service`, as required by Effect's
+TS7 integration; the old package is no longer installed. Typechecking reports
+Effect diagnostics for runtime, stack, and infrastructure alongside ordinary
+type errors. Oxlint handles correctness and import boundaries separately.
+Select the workspace TypeScript version in your editor to use the patched compiler.
 The TypeScript and import-boundary checks are deliberately separate from formatting.
 
 Tool setup follows https://oxc.rs/docs/guide/usage/linter/config ,
 https://oxc.rs/docs/guide/usage/formatter/config , and
-https://github.com/Effect-TS/language-service . The native Alchemy Vitest adapter
+https://effect.website/docs/v4/getting-started/devtools and
+https://github.com/Effect-TS/tsgo . The native Alchemy Vitest adapter
+was verified against the installed beta.83 implementation in
+`alchemy/src/Test/Vitest.ts`, including its cleanup hooks.TypeScript 7.0.2 is an explicit development dependency. Effect's official
+native integration, `@effect/tsgo` 0.53.4, replaces the old JavaScript
+`@effect/language-service` package. Its setup command retains the
+`@effect/language-service` plugin configuration key and adds the native
+configuration schema in `tsconfig.json`. The recommended `prepare` hook runs
+`effect-tsgo patch --typescript --no-oxlint` after installation, replacing the
+local native compiler with the matching Effect-enabled build. Consequently,
+`npm run check` uses TypeScript 7 and reports build-time Effect diagnostics,
+not just editor hints. No removed compiler options needed changing.
+
+For editor diagnostics, configure the editor to use `effect-tsgo` as its sole
+TypeScript language server, not a second server alongside stock TypeScript.
+See https://github.com/Effect-TS/tsgo for editor setup. Unlike the old plugin,
+selecting a workspace JavaScript TypeScript version alone is not sufficient.
+
+The pinned Effect integration explicitly supports TypeScript 7.0.2 and Oxlint
+1.88.0. Upgrade it together with TypeScript when the native compiler changes;
+its replacement binaries are version-specific. Oxlint remains syntax-based
+correctness and boundary linting here, with no experimental type-aware patch.
+Oxfmt and Vitest need no TypeScript compiler plugin. The TypeScript and
+import-boundary checks are deliberately separate from formatting.
+
+Alchemy's transitive `capnp-es` 0.0.16 declares an optional TypeScript peer
+range that stops at version 6. A fresh `npm ci`, native typecheck, and the
+local runtime integration test pass, but `npm ls typescript` still reports
+that optional peer mismatch. This prototype uses its serialization runtime,
+not its TypeScript-generating compiler. No peer override or forced dependency
+upgrade is applied.
+
+Tool setup follows https://oxc.rs/docs/guide/usage/linter/config ,
+https://oxc.rs/docs/guide/usage/formatter/config , and
+https://effect.website/docs/v4/getting-started/devtools and
+https://github.com/Effect-TS/tsgo . The native Alchemy Vitest adapter
 was verified against the installed beta.83 implementation in
 `alchemy/src/Test/Vitest.ts`, including its cleanup hooks.
