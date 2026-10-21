@@ -1,4 +1,4 @@
-import type { Env } from "./env";
+import type { Env } from "../alchemy.run";
 
 // Local-only: Alchemy refuses non-dev mode and binds this gateway to loopback.
 // Reaching it permits code execution; never expose or tunnel the dev server.

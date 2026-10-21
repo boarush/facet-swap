@@ -1,6 +1,7 @@
 import * as Alchemy from "alchemy";
 import { AlchemyContext } from "alchemy/AlchemyContext";
 import * as Cloudflare from "alchemy/Cloudflare";
+import type { InferEnv } from "alchemy/Cloudflare";
 import { localState } from "alchemy/State";
 import * as Effect from "effect/Effect";
 import type { Supervisor } from "./src/supervisor";
@@ -22,6 +23,9 @@ export const worker = Effect.gen(function* () {
     dev: { host: "127.0.0.1", port: Number(process.env.PORT ?? 18743), strictPort: true },
   });
 });
+
+// Bindings typed straight from the stack, so src never hand-writes them.
+export type Env = InferEnv<typeof worker>;
 
 export default Alchemy.Stack("FacetSwap", {
   providers: Cloudflare.providers(),

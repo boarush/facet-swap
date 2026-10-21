@@ -1,4 +1,4 @@
-import type { Env } from "./env";
+import type { Env } from "../alchemy.run";
 import { publishLocally } from "./dev-publish";
 
 export { Supervisor } from "./supervisor";

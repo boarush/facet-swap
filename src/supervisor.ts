@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import type { Env } from "./env";
+import type { Env } from "../alchemy.run";
 import { loadApp, VersionSource } from "./version-source";
 import { trackResponseBody } from "./stream-lifetime";
 

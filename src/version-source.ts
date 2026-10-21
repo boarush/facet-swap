@@ -1,4 +1,4 @@
-import type { Env } from "./env";
+import type { Env } from "../alchemy.run";
 
 export class VersionSource {
   private lastCheck = -Infinity;
