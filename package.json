@@ -1,0 +1,29 @@
+{
+  "name": "facet-swap",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "bun --conditions=bun node_modules/alchemy/bin/cli.js dev --no-input",
+    "test": "node scripts/test.mjs",
+    "deploy": "node scripts/deploy.mjs",
+    "check": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@cloudflare/workers-types": "^5.20261018.1",
+    "@effect/platform-bun": "^4.0.5",
+    "@effect/platform-node": "^4.0.5",
+    "alchemy": "^2.0.0-beta.83",
+    "esbuild": "^0.28.2",
+    "typescript": "^6.0.3",
+    "workerd": "1.20261021.1"
+  },
+  "private": true,
+  "overrides": {
+    "workerd": "1.20261021.1"
+  }
+}

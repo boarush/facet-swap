@@ -1,0 +1,34 @@
+import { DurableObject } from "cloudflare:workers";
+declare const VERSION: string;
+export class App extends DurableObject<{ HASH: string }> {
+  fetch(request: Request): Response {
+    const url = new URL(request.url);
+    const served = this.ctx.storage.kv.get<number>("served") ?? 0;
+    if (url.pathname === "/version") return Response.json({ v: VERSION, hash: this.env.HASH, served });
+    if (url.pathname !== "/stream") return new Response("Not found", { status: 404 });
+    const count = Number(url.searchParams.get("n") ?? 10);
+    const ms = Number(url.searchParams.get("ms") ?? 500);
+    if (!Number.isInteger(count) || count < 1 || count > 10000 || !Number.isFinite(ms) || ms < 0 || ms > 10000) {
+      return new Response("Invalid n/ms", { status: 400 });
+    }
+    this.ctx.storage.kv.put("served", served + 1);
+    let seq = 0;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let wake: (() => void) | undefined;
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      pull: async controller => {
+        if (seq > 0 && ms > 0) await new Promise<void>(resolve => { wake = resolve; timer = setTimeout(resolve, ms); });
+        if (cancelled) return;
+        seq++;
+        controller.enqueue(encoder.encode("id: " + seq + "\ndata: " + JSON.stringify({
+          v: VERSION, hash: this.env.HASH, seq, msg: "hello from " + VERSION, served: served + 1,
+        }) + "\n\n"));
+        if (seq === count) controller.close();
+      },
+      cancel: () => { cancelled = true; clearTimeout(timer); wake?.(); },
+    });
+    return new Response(body, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } });
+  }
+}
