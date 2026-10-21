@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { createServer } from "node:net";
-import { open } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
+import * as Test from "alchemy/Test/Bun";
+import * as Cloudflare from "alchemy/Cloudflare";
+import * as Effect from "effect/Effect";
+import { resources } from "../alchemy.run.ts";
 
 const port = await new Promise(resolve => {
   const server = createServer();
@@ -11,15 +13,11 @@ const port = await new Promise(resolve => {
     server.close(() => resolve(port));
   });
 });
-process.env.BASE_URL = "http://127.0.0.1:" + port;
-const { deploy, base } = await import("./deploy.mjs");
-const log = await open("test-dev.log", "w");
-const child = spawn("npm", ["run", "dev", "--", "--stage", "test_" + process.pid], {
-  env: { ...process.env, PORT: String(port), CHECK_INTERVAL_MS: "0" },
-  detached: true, stdio: ["ignore", log.fd, log.fd],
-});
-const timeout = setTimeout(() => { console.error("FAIL test deadline exceeded"); stop(); process.exit(1); }, 90000);
-function stop() { try { process.kill(-child.pid, "SIGTERM"); } catch {} }
+const base = "http://127.0.0.1:" + port;
+process.env.PORT = String(port);
+process.env.CHECK_INTERVAL_MS = "0";
+const { test } = Test.make({ providers: Cloudflare.providers(), dev: true,
+  stage: "test_" + process.pid });
 async function get(path) {
   const response = await fetch(base + path);
   assert.equal(response.status, 200, await response.clone().text());
@@ -66,14 +64,24 @@ function stream(user, n, ms) {
   return { started, done };
 }
 const pass = message => console.log("PASS " + message);
-try {
-  await until(async () => {
-    try { return (await fetch(base + "/health")).ok; } catch { return false; }
-  });
-  pass("Alchemy local dev starts without Cloudflare credentials");
+test.provider("facet swap", stack => Effect.gen(function* () {
+  const context = yield* Effect.context();
+  const deploy = async version => {
+    const result = await Effect.runPromise(stack.deploy(resources(version)).pipe(Effect.provideContext(context)));
+    return result.published.hash;
+  };
+  yield* Effect.tryPromise(async () => {
   const a = "alice_" + process.pid;
   const b = "bob_" + process.pid;
   const v1 = await deploy("v1");
+  const before = await get("/__local/publication");
+  const repeated = await deploy("v1");
+  assert.equal(repeated, v1);
+  assert.deepEqual(await get("/__local/publication"), before);
+  pass("unchanged stack redeploy skips R2 upload and KV latest write");
+  assert.equal((await fetch(base + "/__local/code", { method: "PUT", body: "bad" })).status, 404);
+  assert.equal((await fetch(base + "/__local/latest", { method: "PUT", body: v1 })).status, 404);
+  pass("old code-execution publication endpoints are removed");
   assert.equal((await get("/u/" + b + "/version")).hash, v1);
   const old = stream(a, 25, 100);
   assert.equal((await old.started).v, "v1");
@@ -118,12 +126,6 @@ try {
   assert.equal(afterCancel.served, 3);
   pass("client cancellation releases inflight, allows pending v3 swap, preserves SQLite");
   console.log("ALL PASS");
-} catch (error) {
-  console.error("FAIL", error);
-  console.error("See test-dev.log");
-  process.exitCode = 1;
-} finally {
-  clearTimeout(timeout);
-  stop();
-  await log.close();
-}
+
+  });
+}), { timeout: 90000 });
