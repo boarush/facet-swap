@@ -86,6 +86,12 @@ test.provider("facet swap", stack => Effect.gen(function* () {
   const old = stream(a, 25, 100);
   assert.equal((await old.started).v, "v1");
   const v2 = await deploy("v2");
+  assert.notEqual(v2, v1);
+  const updated = await get("/__local/publication");
+  assert.equal(updated.hash, v2);
+  assert.equal(updated.metadata.version, "v2");
+  assert.notEqual(updated.metadata.publication, before.metadata.publication);
+  assert.notEqual(updated.uploaded, before.uploaded);
   let queuedResolved = false;
   const queued = get("/u/" + a + "/version").then(value => { queuedResolved = true; return value; });
   await until(async () => {

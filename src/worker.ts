@@ -7,7 +7,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/health") return new Response("ready");
     if (url.pathname === "/__local/publication") {
-      const latest = await env.VERSIONS.getWithMetadata<{ publication: string }>("latest");
+      const latest = await env.VERSIONS.getWithMetadata<{ publication: string; version: string }>("latest");
       const object = latest.value ? await env.CODE.head("code/" + latest.value + ".js") : null;
       return Response.json({ hash: latest.value, metadata: latest.metadata,
         uploaded: object?.uploaded.toISOString() });

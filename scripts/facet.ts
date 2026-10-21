@@ -9,16 +9,16 @@ export const bundleFacet = (version: string) => Bundle.build({
   external: ["cloudflare:workers"],
   transform: { target: "es2022", define: { VERSION: JSON.stringify(version) } },
 }, { format: "esm", codeSplitting: false }).pipe(Effect.map(bundle => {
-  if (bundle.files.length !== 1 || typeof bundle.files[0].content !== "string") {
+  const file = bundle.files[0];
+  if (bundle.files.length !== 1 || typeof file.content !== "string") {
     throw new Error("A facet must be a single JavaScript module");
   }
   // The loader verifies the module bytes, not Alchemy's aggregate bundle hash.
-  const file = bundle.files[0];
-  return { code: file.content as string, hash: file.hash };
+  return { code: file.content, hash: file.hash, version };
 }), Effect.orDie);
 
 export const publishFacet = (bucket: Cloudflare.R2.Bucket, namespace: Cloudflare.KV.Namespace,
-  bundle: { code: string; hash: string }) => Effect.gen(function* () {
+  bundle: { code: string; hash: string; version: string }) => Effect.gen(function* () {
   const Upload = Alchemy.Action("FacetCode", Effect.gen(function* () {
     const r2 = yield* Cloudflare.R2.WriteBucket(bucket);
     return Effect.fn(function* (input: { code: string; hash: string }) {
@@ -27,15 +27,15 @@ export const publishFacet = (bucket: Cloudflare.R2.Bucket, namespace: Cloudflare
       return { hash: input.hash, uploaded: object.uploaded.toISOString() };
     });
   }).pipe(Effect.provide(Cloudflare.R2.WriteBucketLocal)));
-  const uploaded = yield* Upload(bundle);
+  const uploaded = yield* Upload({ code: bundle.code, hash: bundle.hash });
   const Publish = Alchemy.Action("FacetLatest", Effect.gen(function* () {
     const kv = yield* Cloudflare.KV.WriteNamespace(namespace);
-    return Effect.fn(function* (input: { hash: string }) {
+    return Effect.fn(function* (input: { hash: string; version: string }) {
       const publication = crypto.randomUUID();
-      yield* kv.put("latest", input.hash, { metadata: { publication } });
+      yield* kv.put("latest", input.hash, { metadata: { publication, version: input.version } });
       return { hash: input.hash, publication };
     });
   }).pipe(Effect.provide(Cloudflare.KV.WriteNamespaceLocal)));
   // An output edge ensures KV advances only after the upload succeeds.
-  return yield* Publish({ hash: uploaded.hash });
+  return yield* Publish({ hash: uploaded.hash, version: bundle.version });
 });
