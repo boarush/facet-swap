@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
-import * as Test from "alchemy/Test/Bun";
+import * as Test from "alchemy/Test/Vitest";
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as Effect from "effect/Effect";
 import { resources } from "../alchemy.run.ts";

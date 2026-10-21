@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "dev": "bun --conditions=bun node_modules/alchemy/bin/cli.js dev --no-input",
-    "test": "bun test test/facet.test.js",
+    "test": "vitest run",
     "deploy": "node scripts/deploy.mjs",
     "check": "tsc --noEmit"
   },
@@ -24,5 +24,9 @@
   "private": true,
   "overrides": {
     "workerd": "1.20261021.1"
+  },
+  "devDependencies": {
+    "@effect/vitest": "^4.0.5",
+    "vitest": "^5.0.5"
   }
 }
