@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "dev": "bun --conditions=bun node_modules/alchemy/bin/cli.js dev --no-input",
-    "test": "bun test scripts/facet.test.js",
+    "test": "bun test test/facet.test.js",
     "deploy": "node scripts/deploy.mjs",
     "check": "tsc --noEmit"
   },

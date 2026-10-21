@@ -5,7 +5,7 @@ import type { InferEnv } from "alchemy/Cloudflare";
 import { localState } from "alchemy/State";
 import * as Effect from "effect/Effect";
 import type { Supervisor } from "./src/supervisor";
-import { bundleFacet, publishFacet } from "./scripts/facet";
+import { bundleFacet, publishFacet } from "./infra/facet";
 import version from "./facet-version";
 
 export const resources = (version: string) => Effect.gen(function* () {
