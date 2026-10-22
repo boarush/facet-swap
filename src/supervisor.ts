@@ -5,17 +5,11 @@ import { trackResponseBody } from "./stream-lifetime";
 
 type AppConfig = { hash: string; readOnly: boolean };
 type VersionState = { current: AppConfig | null; pending: AppConfig | null };
-type WaitingRequest = {
-  request: Request;
-  resolve: (response: Response) => void;
-  reject: (error: unknown) => void;
-};
 
 // This class stays stable; only the app facet's code is versioned.
 export class Supervisor extends DurableObject<Env> {
   private state: VersionState;
   private inflight = 0;
-  private queue: WaitingRequest[] = [];
   private swapping = false;
   private readonly versions: VersionSource;
 
@@ -31,7 +25,6 @@ export class Supervisor extends DurableObject<Env> {
       return Response.json({
         ...this.state,
         inflight: this.inflight,
-        queued: this.queue.length,
         swapping: this.swapping,
       });
     }
@@ -50,7 +43,18 @@ export class Supervisor extends DurableObject<Env> {
       return Response.json({ accepted: true });
     }
     // Close admission while pending so new traffic cannot starve the update.
-    if (this.state.pending || this.swapping) return this.waitForSwap(request);
+    if (this.state.pending) {
+      // Clients own retries; never retain requests while old bodies drain.
+      return new Response("Update pending; retry later", {
+        status: 503,
+        headers: {
+          "Retry-After": "1",
+          "X-Current-Version": this.state.current?.hash ?? "",
+          "X-Pending-Version": this.state.pending.hash,
+          "Cache-Control": "no-store",
+        },
+      });
+    }
     if (!this.state.current) return new Response("Publish a version first", { status: 503 });
     return this.serve(request);
   }
@@ -65,12 +69,6 @@ export class Supervisor extends DurableObject<Env> {
         this.ctx.storage.kv.put("app-config", this.state);
       }
       this.swapWhenIdle();
-    });
-  }
-
-  private waitForSwap(request: Request): Promise<Response> {
-    return new Promise((resolve, reject) => {
-      this.queue.push({ request, resolve, reject });
     });
   }
 
@@ -90,8 +88,6 @@ export class Supervisor extends DurableObject<Env> {
     } finally {
       this.swapping = false;
     }
-    const queued = this.queue.splice(0);
-    for (const item of queued) this.serve(item.request).then(item.resolve, item.reject);
   }
 
   private async serve(request: Request): Promise<Response> {

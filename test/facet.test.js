@@ -71,6 +71,14 @@ function stream(user, n, ms) {
   done.catch((error) => first(Promise.reject(error)));
   return { started, done };
 }
+async function rejectedDuringDrain(path, current, pending, init) {
+  const response = await fetch(base + path, init);
+  assert.equal(response.status, 503, await response.text());
+  assert.equal(response.headers.get("Retry-After"), "1");
+  assert.equal(response.headers.get("X-Current-Version"), current);
+  assert.equal(response.headers.get("X-Pending-Version"), pending);
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
+}
 const pass = (message) => console.log("PASS " + message);
 test.provider(
   "facet swap",
@@ -111,29 +119,26 @@ test.provider(
         assert.equal(updated.metadata.version, "v2");
         assert.notEqual(updated.metadata.publication, before.metadata.publication);
         assert.notEqual(updated.uploaded, before.uploaded);
-        let queuedResolved = false;
-        const queued = get("/u/" + a + "/version").then((value) => {
-          queuedResolved = true;
-          return value;
-        });
-        await until(async () => {
-          const status = await get("/u/" + a + "/__status");
-          return status.pending?.hash === v2 && status.queued === 1 && status.inflight === 1;
-        });
-        assert.equal(queuedResolved, false);
-        pass("request during drain is queued, active stream still counted");
+        await rejectedDuringDrain("/u/" + a + "/version", v1, v2);
+        const draining = await get("/u/" + a + "/__status");
+        assert.equal(draining.pending.hash, v2);
+        assert.equal(draining.current.hash, v1);
+        assert.equal(draining.inflight, 1);
+        pass(
+          "request during drain gets 503 with retry/version headers, active stream still counted",
+        );
         const bob = await get("/u/" + b + "/version");
         assert.equal(bob.hash, v2);
         assert.equal(bob.served, 0);
-        assert.equal(queuedResolved, false);
         pass("another user's supervisor updates independently during Alice's drain");
         const oldEvents = await old.done;
         assert(oldEvents.every((event) => event.v === "v1" && event.hash === v1));
         pass("all 25 SSE events finish on v1, without truncation or mixed versions");
-        const after = await queued;
+        await until(async () => (await get("/u/" + a + "/__status")).pending === null);
+        const after = await get("/u/" + a + "/version");
         assert.equal(after.hash, v2);
         assert.equal(after.served, 1);
-        pass("queued request resumes on v2 and facet SQLite counter survives abort");
+        pass("retry succeeds on v2 and facet SQLite counter survives abort");
         const fresh = stream(a, 3, 10);
         const freshEvents = await fresh.done;
         assert(
@@ -149,13 +154,17 @@ test.provider(
         const reader = response.body.getReader();
         await reader.read();
         const v3 = await deploy("v3");
-        const cancelledQueue = get("/u/" + a + "/version");
-        await until(async () => (await get("/u/" + a + "/__status")).queued === 1);
+        await rejectedDuringDrain("/u/" + a + "/version", v2, v3);
+        assert.equal((await get("/u/" + a + "/__status")).inflight, 1);
         aborter.abort();
         try {
           await reader.cancel();
         } catch {}
-        const afterCancel = await cancelledQueue;
+        await until(async () => {
+          const status = await get("/u/" + a + "/__status");
+          return status.pending === null && status.inflight === 0 && status.current.hash === v3;
+        });
+        const afterCancel = await get("/u/" + a + "/version");
         assert.equal(afterCancel.hash, v3);
         assert.equal(afterCancel.served, 3);
         pass("client cancellation releases inflight, allows pending v3 swap, preserves SQLite");
@@ -211,15 +220,15 @@ test.provider(
         assert.equal(status.current.readOnly, false);
         assert.equal(status.pending.readOnly, true);
         assert.equal(status.inflight, 1);
-        let scopeResolved = false;
-        const afterScope = note(a, "secret", "must not write").then((response) => {
-          scopeResolved = true;
-          return response;
+        await rejectedDuringDrain("/u/" + a + "/notes?key=secret", v3, v3, {
+          method: "PUT",
+          body: "must not write",
         });
-        await until(async () => (await get("/u/" + a + "/__status")).queued === 1);
-        assert.equal(scopeResolved, false);
+        assert.equal((await note(b, "secret", "bob still writes")).status, 200);
+        assert.equal((await get("/u/" + a + "/__status")).inflight, 1);
         assert.equal((await drainingScope.done).length, 12);
-        assert.equal((await afterScope).status, 403);
+        await until(async () => (await get("/u/" + a + "/__status")).pending === null);
+        assert.equal((await note(a, "secret", "must not write")).status, 403);
         assert.equal((await (await note(a, "secret")).json()).value, "alice only");
         assert.equal((await get("/u/" + a + "/version")).hash, v3);
         await scope(b, false);
