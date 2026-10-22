@@ -1,4 +1,5 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+
 import type { GatewayEnv } from "../alchemy.run";
 
 // Only trusted service callers get this unscoped API. No public data route.

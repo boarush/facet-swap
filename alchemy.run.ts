@@ -4,9 +4,11 @@ import * as Cloudflare from "alchemy/Cloudflare";
 import type { InferEnv } from "alchemy/Cloudflare";
 import { localState } from "alchemy/State";
 import * as Effect from "effect/Effect";
+
+import { bundleFacet, publishFacet } from "./infra/facet";
 import type { Notes } from "./src/gateway";
 import type { Supervisor } from "./src/supervisor";
-import { bundleFacet, publishFacet } from "./infra/facet";
+
 import version from "./facet-version";
 import "./infra/reconcile";
 

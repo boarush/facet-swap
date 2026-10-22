@@ -9,14 +9,14 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "dev": "bun --conditions=bun node_modules/alchemy/bin/cli.js dev --no-input",
-    "test": "vitest run",
-    "deploy": "node scripts/deploy.mjs",
     "check": "tsc --noEmit",
-    "lint": "oxlint --deny-warnings .",
+    "deploy": "node scripts/deploy.mjs",
+    "dev": "bun --conditions=bun node_modules/alchemy/bin/cli.js dev --no-input",
     "fmt": "oxfmt --write .",
     "fmt:check": "oxfmt --check .",
-    "prepare": "effect-tsgo patch --typescript --oxlint"
+    "lint": "oxlint --deny-warnings .",
+    "prepare": "effect-tsgo patch --typescript --oxlint",
+    "test": "vitest run"
   },
   "dependencies": {
     "@cloudflare/workers-types": "^5.20261018.1",

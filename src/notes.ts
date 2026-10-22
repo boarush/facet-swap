@@ -1,4 +1,5 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+
 import type { Env } from "../alchemy.run";
 
 export type NotesScope = { user: string; readOnly: boolean };

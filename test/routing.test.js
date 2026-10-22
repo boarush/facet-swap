@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+
 import { afterEach, test, vi } from "vitest";
 
 vi.mock("cloudflare:workers", () => ({

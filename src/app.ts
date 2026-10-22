@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
-import { createRouter } from "./router";
 
 import type { ScopedNotes } from "./notes";
+import { createRouter } from "./router";
 import type { Scheduler } from "./scheduler";
 
 declare const VERSION: string;

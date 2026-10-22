@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+
 import { test } from "vitest";
+
 import { trackResponseBody } from "../src/stream-lifetime";
 
 const reason = { reason: "drain-deadline", oldVersion: "old", newVersion: "new" };

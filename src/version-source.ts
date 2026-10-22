@@ -1,7 +1,9 @@
 import { exports } from "cloudflare:workers";
+
+import type { Env } from "../alchemy.run";
+
 import type { App } from "./app";
 import type { NotesScope } from "./notes";
-import type { Env } from "../alchemy.run";
 
 export class VersionSource {
   private lastCheck = -Infinity;
