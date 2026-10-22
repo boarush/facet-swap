@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This local prototype changes application code without interrupting requests already in progress. A stable Supervisor waits for its current work to finish before replacing a named application facet. Each user updates independently, and the facet's SQLite-backed state survives replacement.
+This local prototype changes application code with a bounded drain. A stable Supervisor lets current work finish before replacing a named application facet, up to a configurable deadline. Work still running at the deadline is cut so one long stream cannot block updates forever. Each user updates independently, and the facet's SQLite-backed state survives replacement.
 
 This is a demonstration of controlled code replacement, not a guarantee against crashes or arbitrary deployment failures. It runs entirely in Alchemy's local environment, with no Cloudflare credentials or production deployment.
 
@@ -52,7 +52,7 @@ The loader cache key includes the code hash, user ID, and permission. Caching so
 
 ### Refreshing Scope
 
-The trusted local control route `PUT /u/<user>/__scope` with JSON `{"readOnly":true}` stages a new configuration with the **same hash**. Current and pending configurations include both hash and permission. Scope refresh closes admission with the same 503 retry response as a code update, waits for inflight bodies to finish, and uses the existing abort/recreate path. Both version headers carry the same hash during a scope-only drain. Recreated F receives the new scoped stub; its SQLite state survives. A revocation therefore takes effect **after draining**, not immediately, and a stream that never ends delays it indefinitely.
+The trusted local control route `PUT /u/<user>/__scope` with JSON `{"readOnly":true}` stages a new configuration with the **same hash**. Current and pending configurations include both hash and permission. Scope refresh closes admission with the same 503 retry response as a code update, waits for inflight bodies to finish or the drain deadline, and uses the same abort/recreate path. Both version headers carry the same hash during a scope-only drain. Recreated F receives the new scoped stub; its SQLite state survives. A revocation therefore takes effect **after draining or at the deadline**, not immediately. The deadline also applies when the code hash stays the same.
 
 The scope route never reaches the facet. It is unauthenticated local test machinery, not a production authorization API. User routes themselves also lack authentication; this proves confinement of a facet's supplied capability, not protection against a client choosing another user's URL. No capability may be retained/shared outside the request-lifetime model if scope revocation is meant to be reliable.
 
@@ -100,11 +100,15 @@ Keep the dev process running and wait for Alchemy's **Done** message before quer
 
 The response includes `Retry-After: 1`, `X-Current-Version`, `X-Pending-Version`, and `Cache-Control: no-store`. Version headers contain content hashes, not labels such as v1. Clients should wait at least the indicated seconds and add jitter before retrying, with a retry budget or cancellation policy. A 503 from this gate means the request did not reach the facet; other failures do not carry that guarantee. Local status and scope-control routes bypass application admission.
 
-A request remains inflight until its response body reaches EOF, errors, or is cancelled. A `TransformStream` pipe tracks that lifetime; receiving response headers alone does not release the request.
+A request remains inflight until its response body reaches EOF, errors, is cancelled, or is cut at the deadline. A Supervisor-owned response wrapper tracks that lifetime; receiving response headers alone does not release the request.
 
-**Swap.** Only at zero inflight does the Supervisor synchronously persist `current = pending`, clear pending, and abort the named `app` facet. Aborting does not delete the facet's SQLite storage. The next facet lookup loads the new App class using the current content hash.
+**Swap.** At zero inflight, the Supervisor clears the drain timer, synchronously persists `current = pending`, clears pending, and aborts the named `app` facet. Aborting does not delete the facet's SQLite storage. The next facet lookup loads the new App class using the current content hash.
 
-**Retry.** After the swap, a new client attempt is served by the new facet. A long stream delays only its own user's update; other users can still make progress. There is no drain deadline or forced swap; an indefinitely open stream leaves that user's new application requests receiving 503 indefinitely. Moving retries to clients avoids retaining waiting requests, but does not shorten the drain.
+**Deadline.** The first pending code or scope change starts a `DRAIN_DEADLINE_MS` timer, defaulting to 30,000 milliseconds. Changing the pending target does not extend it. If work is still active when the timer fires, the Supervisor commits pending and force-swaps, terminating old requests and aborting the facet. Its response wrapper first appends a final `event: update-abort` to open SSE bodies, then closes them. The event's JSON data contains `reason: "drain-deadline"`, `oldVersion`, and `newVersion`; versions are hashes and are equal for a scope-only swap. This hint is best-effort if the connection has already failed. Non-SSE bodies error instead of receiving an SSE suffix. Work still awaiting headers receives a retryable 503 if facet abort rejects its fetch.
+
+The timer uses `setTimeout`, not a Durable Object alarm. [Scheduled timers prevent hibernation](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/), and this timer only needs to act on live, in-memory requests. It is not a crash-recovery scheduler or an exact wall-clock guarantee during runtime failure. On Supervisor reconstruction, inflight tracking cannot be recovered, so any persisted pending change commits immediately rather than starting another drain window.
+
+**Retry.** After either swap path, a new client attempt is served by the new facet. A long stream delays only its own user's update, for at most the drain window while the runtime remains live; other users can still make progress. Clients should handle both admission 503s and interrupted streams. An abort does not undo completed writes or external calls, so retrying work needs application-level idempotency or checkpoints.
 
 ### Supervisor Lifecycle
 
@@ -113,7 +117,9 @@ stateDiagram-v2
   [*] --> Running
   Running --> Draining: new code or scope persisted
   Draining --> Draining: existing bodies finish, arrivals get 503
-  Draining --> Swapping: inflight is zero
+  Draining --> Swapping: inflight is zero, clear timer
+  Draining --> ForcedSwap: drain deadline reached
+  ForcedSwap --> Running: persist current, end old bodies, abort app, reopen admission
   Swapping --> Running: persist current, abort app, reopen admission
 ```
 
@@ -140,8 +146,13 @@ sequenceDiagram
   Note over S: persist pending H2, close admission
   S-->>B: 503, Retry-After 1, current H1, pending H2
   Note over B: wait Retry-After plus jitter
-  F-->>A: final v1 event and EOF
-  Note over S: inflight zero, persist current H2
+  alt Old stream finishes before deadline
+    F-->>A: final v1 event and EOF
+    Note over S: inflight zero, clear timer, persist current H2
+  else Drain deadline reached
+    Note over S: persist current H2
+    S-->>A: event update-abort, oldVersion H1, newVersion H2, EOF
+  end
   S->>F: abort app, preserve SQLite
   Note over S,F: next get loads App class for H2
   B->>S: retry GET /version
@@ -151,7 +162,7 @@ sequenceDiagram
 
 ## State and Forward-Only Changes
 
-Current and pending code/scope configurations are durable; the inflight count and active connections are not. There is no waiting-request queue. Persisting current before abort lets a restarted Supervisor select the intended code, but a Supervisor crash can still lose open streams. Retry scheduling belongs to clients, not Supervisor memory.
+Current and pending code/scope configurations are durable; active requests and the timer are not. There is no waiting-request queue. Persisting current before abort lets a restarted Supervisor select the intended code. A pending configuration recovered on wake is committed immediately because there is no recoverable inflight set to drain. A Supervisor crash can still lose open streams without a final abort event. Retry scheduling belongs to clients, not Supervisor memory.
 
 Application state belongs in the facet's SQLite database. The demo writes a served counter before starting each stream, once per stream rather than once per event. The counter survives code replacement.
 
@@ -175,11 +186,11 @@ Alchemy is pinned to beta.83, with an npm override to workerd 1.20261021.1 for t
 
 ## What the Integration Test Proves
 
-Vitest uses Alchemy's native `alchemy/Test/Vitest` adapter, a real local-provider sidecar, an isolated stage, and a random loopback port. The adapter owns server cleanup and scratch-stack destruction. Its test watchdog is not a Supervisor drain timeout.
+Vitest uses Alchemy's native `alchemy/Test/Vitest` adapter, a real local-provider sidecar, an isolated stage, and a random loopback port. The adapter owns server cleanup and scratch-stack destruction. Tests set `DRAIN_DEADLINE_MS=3000` and use a separate watchdog for the full test run.
 
 The test deploys v1 twice and checks that the actual R2 upload time and KV publication metadata are unchanged. It then publishes v2 during a stream, checks that a new request immediately receives 503 with retry and current/pending hash headers while the old body remains inflight, and verifies all 25 old events remain v1. A retry after draining and a fresh stream use v2, and the facet counter survives. A second user's Supervisor updates independently. Publishing v3 and cancelling an active body verifies cancellation releases inflight and permits a successful retry.
 
-The old writable publication endpoints return 404. Read-only publication and Supervisor-status diagnostics remain, alongside the trusted local scope-control route. The test additionally checks actual facet RPC reads/writes, isolation between Alice and Bob with the same code hash, path-escape rejection, gateway-redeploy behavior (including the pinned local channel limitation), and read-only scope refresh during an active stream. Scope-only drains reject writes with 503 and equal current/pending hash headers; after draining, retried writes receive 403 under the new permission. Bob can still write during Alice's scope drain.
+The old writable publication endpoints return 404. Read-only publication and Supervisor-status diagnostics remain, alongside the trusted local scope-control route. The test additionally checks actual facet RPC reads/writes, isolation between Alice and Bob with the same code hash, path-escape rejection, gateway-redeploy behavior (including the pinned local channel limitation), and read-only scope refresh during an active stream. Scope-only drains reject writes with 503 and equal current/pending hash headers; after draining, retried writes receive 403 under the new permission. Bob can still write during Alice's scope drain. Long-stream tests exercise both code and scope deadlines, check the final abort event's old/new hashes, and verify that retries use the new code or permission. Wrapper unit tests cover EOF, cancellation, pending reads, and non-SSE aborts.
 
 ## Running the Demo
 
@@ -206,7 +217,7 @@ npm run deploy -- v1
 curl -N 'http://127.0.0.1:18743/u/alice/stream?n=20&ms=500'
 ```
 
-While the stream runs, publish v2 from another terminal. After Alchemy Done, request `/u/alice/version`. It immediately returns 503 with retry and version headers while Alice's old stream is active. Wait at least one second plus a little jitter, then retry; once the stream finishes and the swap completes, the response contains v2. Bob's requests are unaffected by Alice's drain.
+While the stream runs, publish v2 from another terminal. After Alchemy Done, request `/u/alice/version`. It immediately returns 503 with retry and version headers while Alice's old stream is active. Wait at least one second plus a little jitter, then retry; once the stream finishes or the deadline cuts it, the response contains v2. A cut SSE stream ends with an `update-abort` event telling the client to retry. Bob's requests are unaffected by Alice's drain. Set `DRAIN_DEADLINE_MS` alongside `CHECK_INTERVAL_MS` when starting dev to change the default 30-second drain window.
 
 ## Limits and Safety
 
