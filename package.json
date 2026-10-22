@@ -29,7 +29,7 @@
   "devDependencies": {
     "@effect/tsgo": "0.53.4",
     "@effect/vitest": "^4.0.5",
-    "oxfmt": "^0.73.0",
+    "oxfmt": "^0.74.0",
     "oxlint": "1.88.0",
     "oxlint-tsgolint": "7.0.2004",
     "typescript": "7.0.2",

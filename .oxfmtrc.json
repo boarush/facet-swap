@@ -4,5 +4,32 @@
   "tabWidth": 2,
   "semi": true,
   "singleQuote": false,
-  "ignorePatterns": [".alchemy/**", "audit.json", "package-lock.json", "facet-version.ts"]
+  "ignorePatterns": [".alchemy/**", "audit.json", "package-lock.json", "facet-version.ts"],
+  "sortImports": {
+    "groups": [
+      ["type-builtin", "value-builtin"],
+      ["type-external", "value-external"],
+      ["project", "type-internal", "value-internal", "type-subpath", "value-subpath"],
+      ["type-parent", "value-parent", "type-sibling", "value-sibling", "type-index", "value-index"],
+      "unknown"
+    ],
+    "customGroups": [
+      {
+        "groupName": "project",
+        "elementNamePattern": [
+          "**/alchemy.run",
+          "./infra/**",
+          "../infra/**",
+          "./src/**",
+          "../src/**"
+        ]
+      }
+    ],
+    "internalPattern": ["~/", "@/", "#", "infra/", "src/"],
+    "newlinesBetween": true,
+    "sortSideEffects": false
+  },
+  "sortPackageJson": {
+    "sortScripts": true
+  }
 }
