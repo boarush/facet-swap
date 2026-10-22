@@ -4,6 +4,7 @@ import { createRouter } from "./router";
 
 export { ScopedNotes } from "./notes";
 export { Scheduler } from "./scheduler";
+export { Supervisor } from "./supervisor";
 
 declare global {
   namespace Cloudflare {
@@ -12,8 +13,6 @@ declare global {
     }
   }
 }
-
-export { Supervisor } from "./supervisor";
 
 const app = createRouter<Env>();
 

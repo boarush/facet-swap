@@ -14,20 +14,23 @@ export function trackResponseBody(
     release();
     return response;
   }
+
   const reader = response.body.getReader();
-  const sse = response.headers.get("content-type")?.split(";")[0].trim() === "text/event-stream";
+  const isEventStream =
+    response.headers.get("content-type")?.split(";")[0].trim() === "text/event-stream";
   let ended = false;
-  let abort: () => void;
+  let onAbort: () => void;
   const finish = () => {
     ended = true;
-    signal.removeEventListener("abort", abort);
+    signal.removeEventListener("abort", onAbort);
     release();
   };
+
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
-      abort = () => {
+      onAbort = () => {
         if (ended) return;
-        if (sse) {
+        if (isEventStream) {
           // The boundary also separates any partially delivered source frame.
           controller.enqueue(
             new TextEncoder().encode(
@@ -41,8 +44,8 @@ export function trackResponseBody(
         finish();
         void reader.cancel(signal.reason).catch(() => {});
       };
-      signal.addEventListener("abort", abort, { once: true });
-      if (signal.aborted) abort();
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
     },
     async pull(controller) {
       try {
