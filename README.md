@@ -12,7 +12,7 @@ The entry Worker routes `/u/<user>/stream` and `/u/<user>/version` to a Supervis
 
 The **Supervisor** has stable code. It handles admission, tracks response lifetimes, and persists the current and pending configurations in its own SQLite-backed storage.
 
-The **Facet** contains the application logic. Worker Loader loads its module by content hash from R2. The facet has a separate SQLite database, preserved when the Supervisor aborts and recreates it. Its version label is compiled into the module; its hash is passed as `env.HASH`, avoiding a self-referential hash. Its only resource access is a scoped `env.NOTES` service stub, not a raw storage binding.
+The **Facet** contains the application logic. Worker Loader loads its module by content hash from R2. The facet has a separate SQLite database, preserved when the Supervisor aborts and recreates it. An optional manual label is compiled into the module as a salt; no label is needed for publication. Its hash is passed as `env.HASH`, avoiding a self-referential hash. Both `/version` and SSE events show a 12-character hash in `v`, the full `hash`, and a `label` only when one is set. Its only resource access is a scoped `env.NOTES` service stub, not a raw storage binding.
 
 ### Architecture
 
@@ -70,15 +70,17 @@ Alchemy's `Bundle.build` uses its rolldown helper to produce one ESM module from
 
 Publication uses two built-in, diffed Alchemy Actions. **FacetCode** writes the module through `WriteBucketLocal`. **FacetLatest** consumes the upload's successful hash output and writes the KV value `latest`, with version and publication metadata, through `WriteNamespaceLocal`. This dependency prevents publication before the code object exists. Both use Alchemy's local emulators, not a custom HTTP publication endpoint.
 
-A stack evaluation still bundles the source to discover changes. Identical module bytes skip the R2 upload, and identical hash/version inputs skip the KV write. Repeating the same label without changing the bundle therefore leaves both publication metadata and upload time unchanged. A forced reconciliation deliberately reruns the Actions.
+A stack evaluation still bundles the source to discover changes. Identical module bytes skip the R2 upload, and identical hash/version inputs skip the KV write. Editing application source changes the hash without a label bump. Changing the optional label also changes the module bytes, so it forces publication even when the source is unchanged. An unchanged source and label leave both publication metadata and upload time unchanged. A forced reconciliation deliberately reruns the Actions.
 
 ### Deploy Flow
 
 ```mermaid
 flowchart TD
-  CLI["npm run deploy -- v2"] --> INPUT[Rewrite facet-version.ts]
-  INPUT --> EVAL[Alchemy dev reconciles stack]
-  EVAL --> BUNDLE[Bundle app with rolldown and embedded version]
+  CLI["npm run deploy"] --> TRIGGER[Change stack reconciliation trigger]
+  SALT["Optional argument or edit to facet-version.ts"] --> LABEL[Set manual salt]
+  LABEL --> EVAL[Alchemy dev reconciles stack]
+  TRIGGER --> EVAL
+  EVAL --> BUNDLE[Bundle app with rolldown and optional salt]
   BUNDLE --> DIFF{Action inputs changed?}
   DIFF -->|no| NOOP[Skip upload and latest write]
   DIFF -->|yes| UPLOAD[FacetCode uploads code/hash.js]
@@ -88,9 +90,11 @@ flowchart TD
   DONE --> REQUEST[Next eligible request checks latest]
 ```
 
-The deploy CLI only rewrites `facet-version.ts`, including a reconciliation comment. It does not bundle or upload anything itself. The comment triggers evaluation even when the label is unchanged, but is not an Action input or part of the facet bundle. After source-only edits, run the CLI again or restart dev; this is not a separate facet-source watcher.
+The normal workflow is to edit `src/app.ts` or its runtime dependencies, then run `npm run deploy` while Alchemy dev is running. With no argument, the CLI leaves `facet-version.ts` untouched, including its comments. It only changes a comment in the stack-imported `infra/reconcile.ts` to request another evaluation. That trigger is not bundled into the facet and is not an Action input, so reconciling unchanged code is a publication no-op. Alchemy watches the stack import graph, not the facet's separately bundled source; this command supplies the missing evaluation trigger. Starting dev also evaluates the current source without needing a label.
 
-Keep the dev process running and wait for Alchemy's **Done** message before querying the new version. Changing the facet version does not change the Supervisor Worker's bundle, so its local provider remains unchanged and existing streams survive the stack reconciliation.
+`facet-version.ts` defaults to an empty string. It is an optional manual salt, not a release counter. `npm run deploy -- my-label` sets it and reconciles; `npm run deploy -- ''` clears it. Reusing the same label does not force publication. Change the label only when you want to change the hash without editing application code. The CLI does not bundle or upload anything itself.
+
+Keep the dev process running and wait for Alchemy's **Done** message before querying the new version. Changing the application source or optional salt does not change the Supervisor Worker's bundle, so its local provider remains unchanged and existing streams survive the stack reconciliation.
 
 ## How a Supervisor Updates
 
@@ -174,7 +178,7 @@ There is no rollback or canary path. A faulty release is corrected by publishing
 
 `src/` holds runtime code: entry Worker, Supervisor, version lookup and loading, response lifetime tracking, and the SSE application.
 
-`infra/` holds the facet bundle and publication Effects used by the stack. `scripts/` contains only the deploy CLI. `test/` contains the Vitest integration test. `facet-version.ts` is the manual stack input.
+`infra/` holds the facet bundle and publication Effects used by the stack. `scripts/` contains only the deploy CLI. `test/` contains the Vitest integration test. `facet-version.ts` is the optional manual salt; `infra/reconcile.ts` is the CLI's stack-only evaluation trigger.
 
 Binding types come from `Env = InferEnv<typeof worker>` and `GatewayEnv = InferEnv<ReturnType<typeof gatewayWorker>>` in `alchemy.run.ts`. Runtime modules import that type only, so stack code stays out of the Worker bundle.
 
@@ -188,9 +192,9 @@ Alchemy is pinned to beta.83, with an npm override to workerd 1.20261021.1 for t
 
 Vitest uses Alchemy's native `alchemy/Test/Vitest` adapter, a real local-provider sidecar, an isolated stage, and a random loopback port. The adapter owns server cleanup and scratch-stack destruction. Tests set `DRAIN_DEADLINE_MS=3000` and use a separate watchdog for the full test run.
 
-The test deploys v1 twice and checks that the actual R2 upload time and KV publication metadata are unchanged. It then publishes v2 during a stream, checks that a new request immediately receives 503 with retry and current/pending hash headers while the old body remains inflight, and verifies all 25 old events remain v1. A retry after draining and a fresh stream use v2, and the facet counter survives. A second user's Supervisor updates independently. Publishing v3 and cancelling an active body verifies cancellation releases inflight and permits a successful retry.
+The test first deploys without a manual label and checks the short-hash display. It changes only application source under a fixed label and verifies publication and a swap in an existing Supervisor, then redeploys unchanged source to check the no-op. Label-only updates exercise publication and swapping without changing application source. The test also deploys v1 twice and checks that the actual R2 upload time and KV publication metadata are unchanged. It then publishes v2 during a stream, checks that a new request immediately receives 503 with retry and current/pending hash headers while the old body remains inflight, and verifies all 25 old events remain v1. A retry after draining and a fresh stream use v2, and the facet counter survives. A second user's Supervisor updates independently. Publishing v3 and cancelling an active body verifies cancellation releases inflight and permits a successful retry.
 
-The old writable publication endpoints return 404. Read-only publication and Supervisor-status diagnostics remain, alongside the trusted local scope-control route. The test additionally checks actual facet RPC reads/writes, isolation between Alice and Bob with the same code hash, path-escape rejection, gateway-redeploy behavior (including the pinned local channel limitation), and read-only scope refresh during an active stream. Scope-only drains reject writes with 503 and equal current/pending hash headers; after draining, retried writes receive 403 under the new permission. Bob can still write during Alice's scope drain. Long-stream tests exercise both code and scope deadlines, check the final abort event's old/new hashes, and verify that retries use the new code or permission. Wrapper unit tests cover EOF, cancellation, pending reads, and non-SSE aborts.
+The old writable publication endpoints return 404. Read-only publication and Supervisor-status diagnostics remain, alongside the trusted local scope-control route. The test additionally checks actual facet RPC reads/writes, isolation between Alice and Bob with the same code hash, path-escape rejection, gateway-redeploy behavior (including the pinned local channel limitation), and read-only scope refresh during an active stream. Scope-only drains reject writes with 503 and equal current/pending hash headers; after draining, retried writes receive 403 under the new permission. Bob can still write during Alice's scope drain. Long-stream tests exercise both code and scope deadlines, check the final abort event's old/new hashes, and verify that retries use the new code or permission. Wrapper unit tests cover EOF, cancellation, pending reads, and non-SSE aborts. An isolated CLI test checks that no-argument deploys preserve the salt file byte-for-byte, explicit arguments set it safely, and an empty argument clears it.
 
 ## Running the Demo
 
@@ -210,14 +214,14 @@ Start local dev with immediate request-driven checks.
 CHECK_INTERVAL_MS=0 npm run dev
 ```
 
-In another terminal, publish v1, wait for Alchemy Done, and open a stream.
+In another terminal, reconcile the current source, wait for Alchemy Done, and open a stream. No manual version is needed.
 
 ```sh
-npm run deploy -- v1
+npm run deploy
 curl -N 'http://127.0.0.1:18743/u/alice/stream?n=20&ms=500'
 ```
 
-While the stream runs, publish v2 from another terminal. After Alchemy Done, request `/u/alice/version`. It immediately returns 503 with retry and version headers while Alice's old stream is active. Wait at least one second plus a little jitter, then retry; once the stream finishes or the deadline cuts it, the response contains v2. A cut SSE stream ends with an `update-abort` event telling the client to retry. Bob's requests are unaffected by Alice's drain. Set `DRAIN_DEADLINE_MS` alongside `CHECK_INTERVAL_MS` when starting dev to change the default 30-second drain window.
+While the stream runs, edit the facet source and run `npm run deploy` again. Or run `npm run deploy -- demo-update` to force a new hash using only the optional salt. After Alchemy Done, request `/u/alice/version`. It immediately returns 503 with retry and version headers while Alice's old stream is active. Wait at least one second plus a little jitter, then retry; once the stream finishes or the deadline cuts it, the response contains the new short hash in `v` and its full `hash`, plus the optional `label` if set. A cut SSE stream ends with an `update-abort` event telling the client to retry. Bob's requests are unaffected by Alice's drain. Set `DRAIN_DEADLINE_MS` alongside `CHECK_INTERVAL_MS` when starting dev to change the default 30-second drain window.
 
 ## Limits and Safety
 
