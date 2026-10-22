@@ -1,6 +1,7 @@
 import type { Env } from "../alchemy.run";
 
 export { ScopedNotes } from "./notes";
+export { Scheduler } from "./scheduler";
 
 declare global {
   namespace Cloudflare {

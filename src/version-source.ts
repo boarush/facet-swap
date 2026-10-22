@@ -1,4 +1,5 @@
 import { exports } from "cloudflare:workers";
+import type { App } from "./app";
 import type { NotesScope } from "./notes";
 import type { Env } from "../alchemy.run";
 
@@ -8,7 +9,7 @@ export class VersionSource {
 
   constructor(private readonly env: Env) {}
 
-  // Request-driven KV checks only: no pushes or alarms; each supervisor checks independently.
+  // Lazy KV checks on requests and application alarms; no background update polling.
   check(onLatest: (hash: string | null) => void): Promise<void> {
     if (this.checking) return this.checking;
     if (Date.now() - this.lastCheck < Number(this.env.CHECK_INTERVAL_MS)) {
@@ -34,9 +35,13 @@ export async function loadApp(env: Env, hash: string, scope: NotesScope) {
       compatibilityDate: "2026-10-21",
       mainModule: "app.js",
       modules: { "app.js": await object.text() },
-      env: { HASH: hash, NOTES: exports.ScopedNotes({ props: scope }) },
+      env: {
+        HASH: hash,
+        NOTES: exports.ScopedNotes({ props: scope }),
+        SCHEDULER: exports.Scheduler({ props: { user: scope.user } }),
+      },
       globalOutbound: null,
     };
   });
-  return { class: worker.getDurableObjectClass("App") };
+  return { class: worker.getDurableObjectClass<App>("App") };
 }

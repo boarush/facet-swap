@@ -3,6 +3,8 @@ import type { Env } from "../alchemy.run";
 import { loadApp, VersionSource } from "./version-source";
 import { trackResponseBody, type UpdateAbort } from "./stream-lifetime";
 
+type ScheduledAlarm = { time: number; token: string };
+
 type AppConfig = { hash: string; readOnly: boolean };
 type VersionState = { current: AppConfig | null; pending: AppConfig | null };
 
@@ -10,6 +12,7 @@ type VersionState = { current: AppConfig | null; pending: AppConfig | null };
 export class Supervisor extends DurableObject<Env> {
   private state: VersionState;
   private swapping = false;
+  private runningAlarm?: string;
   private readonly active = new Set<AbortController>();
   private drainTimer?: ReturnType<typeof setTimeout>;
   private readonly versions: VersionSource;
@@ -58,6 +61,54 @@ export class Supervisor extends DurableObject<Env> {
     }
     if (!this.state.current) return new Response("Publish a version first", { status: 503 });
     return this.serve(request);
+  }
+
+  // Keep the logical due time separate from the physical alarm's drain deferrals.
+  async setAlarm(time: number | Date): Promise<void> {
+    const scheduled = { time: Number(time), token: crypto.randomUUID() };
+    await this.ctx.storage.transaction(async (storage) => {
+      await storage.put("app-alarm", scheduled);
+      await storage.setAlarm(scheduled.time);
+    });
+  }
+
+  getAlarm(): number | null {
+    const scheduled = this.ctx.storage.kv.get<ScheduledAlarm>("app-alarm");
+    // Like native alarms, the running delivery is not a pending alarm.
+    return scheduled && scheduled.token !== this.runningAlarm ? scheduled.time : null;
+  }
+
+  async deleteAlarm(): Promise<void> {
+    await this.ctx.storage.transaction(async (storage) => {
+      await storage.delete("app-alarm");
+      await storage.deleteAlarm();
+    });
+  }
+
+  async alarm(info?: AlarmInvocationInfo): Promise<void> {
+    await this.checkForUpdate();
+    const scheduled = this.ctx.storage.kv.get<ScheduledAlarm>("app-alarm");
+    if (!scheduled) return;
+    if (scheduled.time > Date.now() || this.state.pending) {
+      // Deferral doesn't consume the alarm or reset the hard drain deadline.
+      await this.ctx.storage.setAlarm(Math.max(scheduled.time, Date.now() + 2000));
+      return;
+    }
+    if (!this.state.current) throw new Error("Publish a version first");
+    const { release } = this.beginWork();
+    this.runningAlarm = scheduled.token;
+    try {
+      // 'alarm' is reserved on DO RPC; the facet's tiny bridge calls its handler.
+      await this.app().dispatchAlarm(info);
+      // A handler can rearm, even for the same time; don't erase its new alarm.
+      if (this.ctx.storage.kv.get<ScheduledAlarm>("app-alarm")?.token === scheduled.token) {
+        this.ctx.storage.kv.delete("app-alarm");
+      }
+    } finally {
+      // On error leave the durable record intact and let native alarm retries run.
+      this.runningAlarm = undefined;
+      release();
+    }
   }
 
   private checkForUpdate(): Promise<void> {
@@ -116,18 +167,26 @@ export class Supervisor extends DurableObject<Env> {
     }
   }
 
-  private async serve(request: Request): Promise<Response> {
+  private app() {
+    const { hash, readOnly } = this.state.current!;
+    const scope = { user: this.ctx.id.toString(), readOnly };
+    return this.ctx.facets.get("app", () => loadApp(this.env, hash, scope));
+  }
+
+  private beginWork() {
     const controller = new AbortController();
     this.active.add(controller);
     const release = () => {
       // Old header/body completions after a forced swap cannot release new work.
       if (this.active.delete(controller)) this.swapWhenIdle();
     };
+    return { controller, release };
+  }
+
+  private async serve(request: Request): Promise<Response> {
+    const { controller, release } = this.beginWork();
     try {
-      const { hash, readOnly } = this.state.current!;
-      const scope = { user: this.ctx.id.toString(), readOnly };
-      const facet = this.ctx.facets.get("app", () => loadApp(this.env, hash, scope));
-      const response = await facet.fetch(request);
+      const response = await this.app().fetch(request);
       return trackResponseBody(response, controller.signal, release);
     } catch (error) {
       release();
