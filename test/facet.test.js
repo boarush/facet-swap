@@ -109,7 +109,7 @@ test.provider(
       yield* Effect.tryPromise(async () => {
         const a = "alice_" + process.pid;
         const b = "bob_" + process.pid;
-        const unlabelled = await deploy();
+        const unlabelled = await deploy("");
         const initial = await get("/u/unlabelled_" + process.pid + "/version");
         assert.equal(initial.hash, unlabelled);
         assert.equal(initial.v, unlabelled.slice(0, 12));

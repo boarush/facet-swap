@@ -1,2 +1,2 @@
 // Optional manual salt. Changing it forces a new bundle hash.
-export default "";
+export default "v1";
