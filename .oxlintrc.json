@@ -1,7 +1,9 @@
 {
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["typescript", "unicorn", "oxc"],
-  "categories": { "correctness": "error" },
+  "$schema": "./node_modules/@effect/tsgo/oxlint-schema.json",
+  "plugins": ["typescript", "unicorn", "oxc", "import", "promise", "effecttsgo"],
+  "categories": {
+    "correctness": "error"
+  },
   "ignorePatterns": [".alchemy/**", "audit.json"],
   "overrides": [
     {
@@ -47,6 +49,36 @@
           }
         ]
       }
+    },
+    {
+      "files": ["test/**/*.js", "test/**/*.ts"],
+      "plugins": ["vitest"],
+      "rules": {
+        "vitest/no-focused-tests": "error",
+        "vitest/no-disabled-tests": "error",
+        "vitest/valid-expect": "error",
+        "vitest/valid-title": "error"
+      }
     }
-  ]
+  ],
+  "extends": ["./node_modules/@effect/tsgo/oxlint-presets/recommended.json"],
+  "rules": {
+    "typescript/no-floating-promises": "error",
+    "typescript/no-misused-promises": "error",
+    "typescript/await-thenable": "error",
+    "typescript/consistent-type-imports": [
+      "error",
+      {
+        "disallowTypeAnnotations": false
+      }
+    ],
+    "import/no-duplicates": "error",
+    "import/no-self-import": "error",
+    "import/no-cycle": "error",
+    "promise/no-return-wrap": "error",
+    "promise/param-names": "error"
+  },
+  "options": {
+    "typeAware": true
+  }
 }

@@ -101,8 +101,10 @@ test.provider(
     Effect.gen(function* () {
       const context = yield* Effect.context();
       const deploy = async (version, gatewayRevision) => {
-        const result = await Effect.runPromise(
-          stack.deploy(resources(version, gatewayRevision)).pipe(Effect.provideContext(context)),
+        const result = await Effect.runPromiseWith(context)(
+          // Alchemy beta.83 exposes a broad deployment error channel.
+          // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context
+          stack.deploy(resources(version, gatewayRevision)),
         );
         return result.published.hash;
       };

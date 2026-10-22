@@ -10,15 +10,19 @@
     "types": ["@cloudflare/workers-types"],
     "plugins": [
       {
-        "name": "@effect/language-service"
+        "name": "@effect/language-service",
+        "diagnostics": false
       }
-    ]
+    ],
+    "allowJs": true
   },
   "include": [
     "src/**/*.ts",
     "infra/**/*.ts",
     "alchemy.run.ts",
     "facet-version.ts",
-    "vitest.config.ts"
+    "vitest.config.ts",
+    "scripts/**/*.mjs",
+    "test/**/*.js"
   ]
 }

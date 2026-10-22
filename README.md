@@ -182,9 +182,9 @@ There is no rollback or canary path. A faulty release is corrected by publishing
 
 Binding types come from `Env = InferEnv<typeof worker>` and `GatewayEnv = InferEnv<ReturnType<typeof gatewayWorker>>` in `alchemy.run.ts`. Runtime modules import that type only, so stack code stays out of the Worker bundle.
 
-Oxlint enforces correctness rules and import boundaries. Runtime cannot import infrastructure, scripts, or tests, and its imports from `alchemy.run` must be type-only. Runtime and infrastructure cannot import CLI entrypoints or tests. Oxfmt handles formatting separately.
+Oxlint runs type-aware correctness rules, the Effect recommended preset, Promise checks, type-only import checks, and focused/disabled-test checks. Warnings fail the lint command. Runtime cannot import infrastructure, scripts, or tests, and its imports from `alchemy.run` must be type-only. Runtime and infrastructure cannot import CLI entrypoints or tests. Oxfmt handles formatting separately.
 
-The installed compiler is TypeScript 7.0.2. `npm run check` invokes its native compiler through `tsc --noEmit`. Effect's `@effect/tsgo` integration patches that compiler during the prepare hook and supplies build-time Effect diagnostics. The configuration retains the `@effect/language-service` plugin key, but the old JavaScript plugin package is not installed. Editors should use the Effect native language server.
+The installed compiler is TypeScript 7.0.2. `npm run check` invokes its native compiler through `tsc --noEmit`. Effect's `@effect/tsgo` integration patches TypeScript, Oxlint, and its `oxlint-tsgolint` backend during the prepare hook. Those three packages are pinned to versions supported by the installed integration; upgrade them together against its compatibility table. Effect diagnostics run through Oxlint, not twice through both lint and typecheck (`diagnostics: false` in the plugin options). JavaScript scripts and tests are included in the TypeScript program for type-aware linting, without enabling `checkJs`. The configuration retains the `@effect/language-service` plugin key, but the old JavaScript plugin package is not installed. Editors should use the Effect native language server.
 
 Alchemy is pinned to beta.83, with an npm override to workerd 1.20261021.1 for the tested facet runtime. No custom workerd launcher or plain Wrangler fallback is used.
 
