@@ -16,6 +16,7 @@ const port = await new Promise((resolve) => {
 const base = "http://127.0.0.1:" + port;
 process.env.PORT = String(port);
 process.env.CHECK_INTERVAL_MS = "0";
+process.env.DRAIN_DEADLINE_MS = "3000";
 const { test } = Test.make({
   providers: Cloudflare.providers(),
   dev: true,
@@ -34,7 +35,7 @@ async function until(fn) {
   }
   throw new Error("Condition timed out");
 }
-function stream(user, n, ms) {
+function stream(user, n, ms, expectAbort = false) {
   let first;
   const started = new Promise((resolve) => {
     first = resolve;
@@ -43,6 +44,7 @@ function stream(user, n, ms) {
     const response = await fetch(base + "/u/" + user + "/stream?n=" + n + "&ms=" + ms);
     assert.equal(response.status, 200);
     const events = [];
+    let updateAbort;
     let buffered = "";
     const decoder = new TextDecoder();
     for await (const chunk of response.body) {
@@ -54,18 +56,30 @@ function stream(user, n, ms) {
         const data = frame.split("\n").find((line) => line.startsWith("data: "));
         if (data) {
           const event = JSON.parse(data.slice(6));
+          if (frame.includes("event: update-abort")) {
+            assert.equal(updateAbort, undefined);
+            updateAbort = event;
+            continue;
+          }
+          assert.equal(updateAbort, undefined, "no source events after update-abort");
           assert.equal(frame.split("\n")[0], "id: " + event.seq);
           events.push(event);
           if (events.length === 1) first(event);
         }
       }
     }
-    assert.equal(events.length, n);
+    if (expectAbort) {
+      assert(updateAbort, "stream must end with update-abort");
+      assert(events.length < n, "deadline must truncate the old stream");
+    } else {
+      assert.equal(updateAbort, undefined, "normal stream must not be cut");
+      assert.equal(events.length, n);
+    }
     assert.deepEqual(
       events.map((e) => e.seq),
-      Array.from({ length: n }, (_, i) => i + 1),
+      Array.from({ length: events.length }, (_, i) => i + 1),
     );
-    return events;
+    return expectAbort ? { events, updateAbort } : events;
   })();
   // Surface startup errors to both consumers.
   done.catch((error) => first(Promise.reject(error)));
@@ -236,6 +250,44 @@ test.provider(
         await scope(a, false);
         assert.equal((await note(a, "secret", "alice writable again")).status, 200);
         pass("same-version scope swap drains before read-only enforcement; other users unaffected");
+        const overdue = stream(a, 100, 1000, true);
+        await overdue.started;
+        const v4 = await deploy("v4", "g2");
+        const pendingAt = Date.now();
+        await rejectedDuringDrain("/u/" + a + "/version", v3, v4);
+        const forced = await overdue.done;
+        assert.deepEqual(forced.updateAbort, {
+          reason: "drain-deadline",
+          oldVersion: v3,
+          newVersion: v4,
+        });
+        assert(forced.events.every((event) => event.hash === v3));
+        assert(Date.now() - pendingAt >= Number(process.env.DRAIN_DEADLINE_MS) - 100);
+        assert(Date.now() - pendingAt < Number(process.env.DRAIN_DEADLINE_MS) + 2000);
+        const afterDeadline = await get("/u/" + a + "/version");
+        assert.equal(afterDeadline.hash, v4);
+        assert.equal((await get("/u/" + a + "/__status")).inflight, 0);
+        const nextStream = await stream(a, 3, 10).done;
+        assert(nextStream.every((event) => event.hash === v4));
+        assert.equal(nextStream[0].served, afterDeadline.served + 1);
+        pass("deadline emits final update-abort, cuts old facet, retry and fresh stream use v4");
+
+        const overdueScope = stream(a, 100, 1000, true);
+        await overdueScope.started;
+        await scope(a, true);
+        await rejectedDuringDrain("/u/" + a + "/notes?key=secret", v4, v4, {
+          method: "PUT",
+          body: "must not write",
+        });
+        const forcedScope = await overdueScope.done;
+        assert.deepEqual(forcedScope.updateAbort, {
+          reason: "drain-deadline",
+          oldVersion: v4,
+          newVersion: v4,
+        });
+        assert.equal((await note(a, "secret", "must not write")).status, 403);
+        assert.equal((await get("/u/" + a + "/__status")).inflight, 0);
+        pass("same-version scope drain has the same hard deadline and enforces new permission");
         console.log("ALL PASS");
       });
     }),

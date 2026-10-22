@@ -38,6 +38,7 @@ export const resources = (version: string, gatewayRevision = "g1") =>
         LOADER: Cloudflare.WorkerLoader(),
         SUPERVISORS: Cloudflare.DurableObject<Supervisor>("Supervisor"),
         CHECK_INTERVAL_MS: process.env.CHECK_INTERVAL_MS ?? "10000",
+        DRAIN_DEADLINE_MS: process.env.DRAIN_DEADLINE_MS ?? "30000",
       },
       dev: { host: "127.0.0.1", port: Number(process.env.PORT ?? 18743), strictPort: true },
     });
