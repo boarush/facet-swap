@@ -18,6 +18,7 @@
         "groupName": "project",
         "elementNamePattern": [
           "**/alchemy.run",
+          "**/alchemy.run.ts",
           "./infra/**",
           "../infra/**",
           "./src/**",
