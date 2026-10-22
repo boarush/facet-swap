@@ -99,7 +99,14 @@ export class Supervisor extends DurableObject<Env> {
     this.runningAlarm = scheduled.token;
     try {
       // 'alarm' is reserved on DO RPC; the facet's tiny bridge calls its handler.
-      await this.app().dispatchAlarm(info);
+      // Runtime AlarmInvocationInfo is not RPC-serializable; copy its public fields.
+      await this.app().dispatchAlarm(
+        info && {
+          scheduledTime: scheduled.time,
+          retryCount: info.retryCount,
+          isRetry: info.isRetry,
+        },
+      );
       // A handler can rearm, even for the same time; don't erase its new alarm.
       if (this.ctx.storage.kv.get<ScheduledAlarm>("app-alarm")?.token === scheduled.token) {
         this.ctx.storage.kv.delete("app-alarm");

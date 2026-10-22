@@ -326,6 +326,84 @@ test.provider(
         assert.equal((await note(a, "secret", "must not write")).status, 403);
         assert.equal((await get("/u/" + a + "/__status")).inflight, 0);
         pass("same-version scope drain has the same hard deadline and enforces new permission");
+        const alarmUser = "alarm_" + process.pid;
+        const alarmPath = "/u/" + alarmUser + "/alarm";
+        const schedule = async (time) => {
+          const response = await fetch(base + alarmPath, {
+            method: "PUT",
+            body: JSON.stringify({ time }),
+          });
+          assert.equal(response.status, 200, await response.clone().text());
+          assert.equal((await response.json()).scheduled, time);
+        };
+        assert.deepEqual(await get(alarmPath), { scheduled: null, count: 0, last: null });
+        const cancelledAt = Date.now() + 300;
+        await schedule(cancelledAt);
+        const deleted = await fetch(base + alarmPath, { method: "DELETE" });
+        assert.equal(deleted.status, 200);
+        assert.equal((await deleted.json()).scheduled, null);
+        await delay(400);
+        assert.equal((await get(alarmPath)).count, 0);
+        await schedule(Date.now() + 200);
+        await until(async () => (await get(alarmPath)).count === 1);
+        assert.deepEqual(await get(alarmPath), {
+          scheduled: null,
+          count: 1,
+          last: { hash: v4, scheduled: null },
+        });
+        pass("facet scheduler set/get/delete uses real alarms; handler sees no pending delivery");
+
+        // No application request to this Supervisor between publication and firing.
+        // The alarm itself must notice latest code and preserve the due time across abort.
+        await schedule(Date.now() + 2000);
+        const v5 = await deploy("v5", "g2");
+        await delay(2200);
+        const swappedAlarm = await get(alarmPath);
+        assert.equal(swappedAlarm.count, 2);
+        assert.deepEqual(swappedAlarm.last, { hash: v5, scheduled: null });
+        assert.equal(swappedAlarm.scheduled, null);
+        pass("an alarm wakes on latest code without traffic; its schedule survives facet swap");
+
+        await schedule(Date.now() + 1000);
+        const alarmDrain = stream(alarmUser, 25, 100);
+        await alarmDrain.started;
+        const v6 = await deploy("v6", "g2");
+        await rejectedDuringDrain("/u/" + alarmUser + "/version", v5, v6);
+        await delay(1200);
+        assert.equal((await get("/u/" + alarmUser + "/__status")).pending.hash, v6);
+        await alarmDrain.done;
+        await until(async () => (await get(alarmPath)).count === 3);
+        assert.deepEqual((await get(alarmPath)).last, { hash: v6, scheduled: null });
+        pass("alarm due during a normal drain defers and runs only after swap on new code");
+
+        await schedule(Date.now() + 1000);
+        const forcedAlarmDrain = stream(alarmUser, 100, 1000, true);
+        await forcedAlarmDrain.started;
+        const v7 = await deploy("v7", "g2");
+        await rejectedDuringDrain("/u/" + alarmUser + "/version", v6, v7);
+        const forcedAlarm = await forcedAlarmDrain.done;
+        assert.equal(forcedAlarm.updateAbort.newVersion, v7);
+        await until(async () => (await get(alarmPath)).count === 4);
+        assert.deepEqual((await get(alarmPath)).last, { hash: v7, scheduled: null });
+        pass("drain deferrals leave the hard deadline intact and deliver after forced swap");
+        // Fault injection stays in the test bundle, not in the demo's alarm API.
+        const alarmSource = await readFile(appPath, "utf8");
+        try {
+          await writeFile(
+            appPath,
+            alarmSource.replace(
+              "async alarm(_info?: AlarmInvocationInfo): Promise<void> {",
+              'async alarm(_info?: AlarmInvocationInfo): Promise<void> { if (!_info?.isRetry) throw new Error("test alarm retry");',
+            ),
+          );
+          const retryHash = await deploy("alarm-retry", "g2");
+          await schedule(Date.now() + 100);
+          await until(async () => (await get(alarmPath)).count === 5);
+          assert.deepEqual((await get(alarmPath)).last, { hash: retryHash, scheduled: null });
+          pass("facet exception reaches native retry; serializable retry metadata reaches handler");
+        } finally {
+          await writeFile(appPath, alarmSource);
+        }
         console.log("ALL PASS");
       });
     }),
