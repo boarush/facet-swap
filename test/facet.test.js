@@ -77,9 +77,9 @@ test.provider(
   (stack) =>
     Effect.gen(function* () {
       const context = yield* Effect.context();
-      const deploy = async (version) => {
+      const deploy = async (version, gatewayRevision) => {
         const result = await Effect.runPromise(
-          stack.deploy(resources(version)).pipe(Effect.provideContext(context)),
+          stack.deploy(resources(version, gatewayRevision)).pipe(Effect.provideContext(context)),
         );
         return result.published.hash;
       };
@@ -159,6 +159,74 @@ test.provider(
         assert.equal(afterCancel.hash, v3);
         assert.equal(afterCancel.served, 3);
         pass("client cancellation releases inflight, allows pending v3 swap, preserves SQLite");
+        // These calls run inside F and cross two real service-binding boundaries.
+        const note = async (user, key, value) => {
+          const response = await fetch(
+            base + "/u/" + user + "/notes?key=" + encodeURIComponent(key),
+            value === undefined ? {} : { method: "PUT", body: value },
+          );
+          return response;
+        };
+        const scope = async (user, readOnly) => {
+          const response = await fetch(base + "/u/" + user + "/__scope", {
+            method: "PUT",
+            body: JSON.stringify({ readOnly }),
+          });
+          assert.equal(response.status, 200, await response.text());
+        };
+        assert.deepEqual(await (await note(a, "secret", "alice only")).json(), {
+          value: "alice only",
+          gateway: "g1",
+        });
+        assert.equal((await (await note(b, "secret")).json()).value, null);
+        await note(b, "secret", "bob only");
+        assert.equal((await (await note(a, "secret")).json()).value, "alice only");
+        assert.equal((await (await note(b, "secret")).json()).value, "bob only");
+        for (const key of ["../" + b + "/secret", b + "/secret", "/secret", ""]) {
+          assert.equal((await note(a, key)).status, 403);
+          assert.equal((await note(a, key, "overwrite")).status, 403);
+        }
+        pass("facet reads/writes its own scope; other-user and traversal keys cannot escape");
+
+        // Alchemy keeps Api alive, but its local service channel still pins the old Gateway.
+        // Record this local-provider limitation rather than claim a transparent refresh.
+        const duringGateway = stream(a, 25, 100);
+        await duringGateway.started;
+        assert.equal(await deploy("v3", "g2"), v3);
+        assert.deepEqual(await (await note(a, "secret")).json(), {
+          value: "alice only",
+          gateway: "g1",
+        });
+        assert.equal((await duringGateway.done).length, 25);
+        pass(
+          "gateway redeploy preserves live stream; local binding stays on g1 (known limitation)",
+        );
+
+        const drainingScope = stream(a, 12, 100);
+        await drainingScope.started;
+        await scope(a, true);
+        const status = await get("/u/" + a + "/__status");
+        assert.equal(status.current.hash, v3);
+        assert.equal(status.pending.hash, v3);
+        assert.equal(status.current.readOnly, false);
+        assert.equal(status.pending.readOnly, true);
+        assert.equal(status.inflight, 1);
+        let scopeResolved = false;
+        const afterScope = note(a, "secret", "must not write").then((response) => {
+          scopeResolved = true;
+          return response;
+        });
+        await until(async () => (await get("/u/" + a + "/__status")).queued === 1);
+        assert.equal(scopeResolved, false);
+        assert.equal((await drainingScope.done).length, 12);
+        assert.equal((await afterScope).status, 403);
+        assert.equal((await (await note(a, "secret")).json()).value, "alice only");
+        assert.equal((await get("/u/" + a + "/version")).hash, v3);
+        await scope(b, false);
+        assert.equal((await note(b, "secret", "bob still writes")).status, 200);
+        await scope(a, false);
+        assert.equal((await note(a, "secret", "alice writable again")).status, 200);
+        pass("same-version scope swap drains before read-only enforcement; other users unaffected");
         console.log("ALL PASS");
       });
     }),
