@@ -11,7 +11,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "deploy": "node scripts/deploy.mjs",
-    "dev": "bun --conditions=bun node_modules/alchemy/bin/cli.js dev --no-input",
+    "dev": "alchemy dev --no-input",
     "fmt": "oxfmt --write .",
     "fmt:check": "oxfmt --check .",
     "lint": "oxlint --deny-warnings .",
@@ -20,7 +20,6 @@
   },
   "dependencies": {
     "@cloudflare/workers-types": "^5.20261018.1",
-    "@effect/platform-bun": "^4.0.5",
     "@effect/platform-node": "^4.0.5",
     "alchemy": "2.0.0-beta.83",
     "hono": "^4.13.13",
@@ -37,5 +36,8 @@
   },
   "overrides": {
     "workerd": "1.20261021.1"
+  },
+  "engines": {
+    "node": "^24.11.1 || >=25.1.0"
   }
 }
