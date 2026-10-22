@@ -1,120 +1,186 @@
-This is a local-only, self-updating Durable Object facet prototype, driven by Alchemy v2. No Cloudflare account, credentials, remote state store, or production deploy is used. The stack refuses to evaluate outside Alchemy dev mode.
+# Self-Updating Services on Durable Object Facets
 
-The entry Worker routes /u/<user>/stream and /u/<user>/version into one Supervisor per user. Each Supervisor owns a stable SQLite database containing current and pending hashes. It lazily reads KV latest on requests, at most once every CHECK_INTERVAL_MS (10000 by default). The facet named app gets its own SQLite database. Its served counter increments once per stream, not once per event.
+## Purpose
 
-A pending update closes admission to that user's facet. Existing response bodies finish before the last inflight slot is released. A TransformStream pipe tracks EOF, errors, and client cancellation, not just response headers. At zero inflight, the Supervisor synchronously persists current=pending and clears pending, aborts app without deleting its storage, then resumes queued requests. The next facet get loads the new class from the hash-keyed Worker Loader. There are no alarms, force swaps, drain deadlines, rollback, or canary paths. An indefinitely open stream deliberately blocks that user's update indefinitely.
+This local prototype changes application code without interrupting requests already in progress. A stable Supervisor waits for its current work to finish before replacing a named application facet. Each user updates independently, and the facet's SQLite-backed state survives replacement.
 
-Install with Node, npm, and Bun available.
+This is a demonstration of controlled code replacement, not a guarantee against crashes or arbitrary deployment failures. It runs entirely in Alchemy's local environment, with no Cloudflare credentials or production deployment.
+
+## The Core Idea
+
+The entry Worker routes `/u/<user>/stream` and `/u/<user>/version` to a Supervisor selected by `idFromName(user)`. Each Supervisor owns a facet named `app`.
+
+The **Supervisor** has stable code. It handles admission, tracks response lifetimes, and persists the current and pending content hashes in its own SQLite-backed storage.
+
+The **Facet** contains the application logic. Worker Loader loads its module by content hash from R2. The facet has a separate SQLite database, preserved when the Supervisor aborts and recreates it. Its version label is compiled into the module; its hash is passed as `env.HASH`, avoiding a self-referential hash.
+
+### Architecture
+
+```mermaid
+flowchart TB
+  C[Client] --> E[Entry Worker]
+  E -->|idFromName user| S
+  subgraph DO[Durable Object per user]
+    S[Stable Supervisor] -->|forward admitted requests| F[Named app facet]
+    S --- SD[(Supervisor SQLite)]
+    F --- FD[(Facet SQLite)]
+  end
+  S -.->|lazy read latest| KV[(KV latest hash)]
+  S -->|get by content hash| L[Worker Loader]
+  L -->|read module on load| R2[(R2 code/hash.js)]
+  L -->|App class| F
+  STACK[Alchemy stack] --> B[Bundle.build using rolldown]
+  B --> U[FacetCode Action]
+  U -->|upload module| R2
+  U -->|successful hash output| P[FacetLatest Action]
+  P -->|publish latest| KV
+```
+
+## Publishing Is Part of the Stack
+
+`alchemy.run.ts` declares the local R2 bucket, KV namespace, Worker Loader binding, Supervisor namespace, and entry Worker. It calls `bundleFacet` and `publishFacet` from `infra/facet.ts` during stack evaluation.
+
+Alchemy's `Bundle.build` uses its rolldown helper to produce one ESM module from `src/app.ts`. The file's SHA-256 hash, not the aggregate bundle hash, addresses `code/<hash>.js`. There is no separate esbuild pipeline.
+
+Publication uses two built-in, diffed Alchemy Actions. **FacetCode** writes the module through `WriteBucketLocal`. **FacetLatest** consumes the upload's successful hash output and writes the KV value `latest`, with version and publication metadata, through `WriteNamespaceLocal`. This dependency prevents publication before the code object exists. Both use Alchemy's local emulators, not a custom HTTP publication endpoint.
+
+A stack evaluation still bundles the source to discover changes. Identical module bytes skip the R2 upload, and identical hash/version inputs skip the KV write. Repeating the same label without changing the bundle therefore leaves both publication metadata and upload time unchanged. A forced reconciliation deliberately reruns the Actions.
+
+### Deploy Flow
+
+```mermaid
+flowchart TD
+  CLI["npm run deploy -- v2"] --> INPUT[Rewrite facet-version.ts]
+  INPUT --> EVAL[Alchemy dev reconciles stack]
+  EVAL --> BUNDLE[Bundle app with rolldown and embedded version]
+  BUNDLE --> DIFF{Action inputs changed?}
+  DIFF -->|no| NOOP[Skip upload and latest write]
+  DIFF -->|yes| UPLOAD[FacetCode uploads code/hash.js]
+  UPLOAD -->|successful hash output| LATEST[FacetLatest writes KV latest]
+  NOOP --> DONE[Wait for Alchemy Done]
+  LATEST --> DONE
+  DONE --> REQUEST[Next eligible request checks latest]
+```
+
+The deploy CLI only rewrites `facet-version.ts`, including a reconciliation comment. It does not bundle or upload anything itself. The comment triggers evaluation even when the label is unchanged, but is not an Action input or part of the facet bundle. After source-only edits, run the CLI again or restart dev; this is not a separate facet-source watcher.
+
+Keep the dev process running and wait for Alchemy's **Done** message before querying the new version. Changing the facet version does not change the Supervisor Worker's bundle, so its local provider remains unchanged and existing streams survive the stack reconciliation.
+
+## How a Supervisor Updates
+
+**Notice.** On incoming requests, each Supervisor reads KV `latest` at most once every `CHECK_INTERVAL_MS`, which defaults to 10,000 milliseconds. Concurrent checks share a promise. There are no alarms, background polling, or update pushes. An idle object checks when traffic returns and its interval permits.
+
+**Drain.** If the hash differs from the current and pending hashes, the Supervisor persists it as pending. New requests wait in an in-memory queue. Requests already admitted continue on the old facet.
+
+A request remains inflight until its response body reaches EOF, errors, or is cancelled. A `TransformStream` pipe tracks that lifetime; receiving response headers alone does not release the request.
+
+**Swap.** Only at zero inflight does the Supervisor synchronously persist `current = pending`, clear pending, and abort the named `app` facet. Aborting does not delete the facet's SQLite storage. The next facet lookup loads the new App class using the current content hash.
+
+**Resume.** Queued requests are served by the new facet. A long stream delays only its own user's update. There is no drain deadline or forced swap; an indefinitely open stream blocks that user's update indefinitely.
+
+### Supervisor Lifecycle
+
+```mermaid
+stateDiagram-v2
+  [*] --> Running
+  Running --> Draining: different hash noticed and persisted
+  Draining --> Draining: existing bodies finish, arrivals queue
+  Draining --> Swapping: inflight is zero
+  Swapping --> Running: persist current, abort app, release queue
+```
+
+When already idle, the Supervisor can swap immediately without spending time draining.
+
+### A Stream During an Update
+
+```mermaid
+sequenceDiagram
+  participant A as Client A
+  participant B as Client B
+  participant S as Supervisor
+  participant F as App facet
+  participant KV as KV latest
+  participant P as Alchemy Actions
+  A->>S: GET /stream
+  S->>F: serve using hash H1
+  F-->>A: SSE events from v1
+  Note over P: FacetCode upload succeeds first
+  P->>KV: FacetLatest publishes H2
+  B->>S: GET /version
+  S->>KV: eligible lazy check
+  KV-->>S: H2
+  Note over S: persist pending H2, queue B
+  F-->>A: final v1 event and EOF
+  Note over S: inflight zero, persist current H2
+  S->>F: abort app, preserve SQLite
+  Note over S,F: next get loads App class for H2
+  S->>F: serve queued B
+  F-->>B: v2 and existing served counter
+```
+
+## State and Forward-Only Changes
+
+Current and pending hashes are durable; the queue, inflight count, and active connections are not. Persisting current before abort lets a restarted Supervisor select the intended code, but a Supervisor crash can still lose waiting requests and open streams.
+
+Application state belongs in the facet's SQLite database. The demo writes a served counter before starting each stream, once per stream rather than once per event. The counter survives code replacement.
+
+For a real long-running application, the **facet itself** must checkpoint meaningful work periodically. The Supervisor does not provide automatic checkpoints. This demo persists its counter, but does not implement resumable stream checkpoints or a migration framework. Application migrations should be repeatable and compatible with forward-only updates.
+
+There is no rollback or canary path. A faulty release is corrected by publishing another version. The Supervisor compares hashes, not ordered release numbers; forward-only publication is a release discipline, not an enforced version-order check.
+
+## Project Layout & Tooling
+
+`src/` holds runtime code: entry Worker, Supervisor, version lookup and loading, response lifetime tracking, and the SSE application.
+
+`infra/` holds the facet bundle and publication Effects used by the stack. `scripts/` contains only the deploy CLI. `test/` contains the Vitest integration test. `facet-version.ts` is the manual stack input.
+
+Binding types come from `Env = InferEnv<typeof worker>` in `alchemy.run.ts`. Runtime modules import that type only, so stack code stays out of the Worker bundle.
+
+Oxlint enforces correctness rules and import boundaries. Runtime cannot import infrastructure, scripts, or tests, and its imports from `alchemy.run` must be type-only. Runtime and infrastructure cannot import CLI entrypoints or tests. Oxfmt handles formatting separately.
+
+The installed compiler is TypeScript 7.0.2. `npm run check` invokes its native compiler through `tsc --noEmit`. Effect's `@effect/tsgo` integration patches that compiler during the prepare hook and supplies build-time Effect diagnostics. The configuration retains the `@effect/language-service` plugin key, but the old JavaScript plugin package is not installed. Editors should use the Effect native language server.
+
+Alchemy is pinned to beta.83, with an npm override to workerd 1.20261021.1 for the tested facet runtime. No custom workerd launcher or plain Wrangler fallback is used.
+
+## What the Integration Test Proves
+
+Vitest uses Alchemy's native `alchemy/Test/Vitest` adapter, a real local-provider sidecar, an isolated stage, and a random loopback port. The adapter owns server cleanup and scratch-stack destruction. Its test watchdog is not a Supervisor drain timeout.
+
+The test deploys v1 twice and checks that the actual R2 upload time and KV publication metadata are unchanged. It then publishes v2 during a stream, observes a queued request through local diagnostics, and verifies all 25 old events remain v1. The queued response and a fresh stream use v2, and the facet counter survives. A second user's Supervisor updates independently. Publishing v3 and cancelling an active body verifies cancellation releases the gate.
+
+The old writable publication endpoints return 404. Only read-only publication and Supervisor-status diagnostics remain.
+
+## Running the Demo
+
+With Node, npm, and Bun available, install dependencies and run the checks.
 
 ```sh
-cd ~/facet-swap
 npm ci
 npm run check
+npm run lint
+npm run fmt:check
 npm test
 ```
 
-Vitest runs the integration test through Alchemy's native `alchemy/Test/Vitest` adapter in dev mode, with its real local-provider sidecar, a random loopback port, and an isolated stage. It deploys the same stack declaration with v1, repeats v1, opens an SSE stream, then deploys v2 mid-stream. The repeated v1 deployment must leave both the actual R2 upload timestamp and KV publication metadata unchanged. It checks a queued request via local diagnostics, proves another user's independent update, checks all 25 old stream events remain v1, checks the queued response and a fresh stream use v2, and verifies the SQLite counter survives. It also publishes v3 and verifies client cancellation releases the gate. The adapter owns the local dev server and closes its shared scope and sidecar in its Vitest afterAll hook; its provider finalizer destroys the scratch stack even on failure. No separate server launcher or globalSetup is necessary. Run `npm test > test-dev.log 2>&1` to capture startup diagnostics. Its test watchdog is not a Supervisor drain timeout.
-
-For a manual demo, run this in one terminal. A zero check interval makes the next request detect publication immediately.
+Start local dev with immediate request-driven checks.
 
 ```sh
 CHECK_INTERVAL_MS=0 npm run dev
 ```
 
-In another terminal, request v1. Once Alchemy reports Done, start a stream.
+In another terminal, publish v1, wait for Alchemy Done, and open a stream.
 
 ```sh
 npm run deploy -- v1
 curl -N 'http://127.0.0.1:18743/u/alice/stream?n=20&ms=500'
 ```
 
-While that stream is running, use a third terminal to publish v2 and request the version. Wait for Alchemy to report Done before the curl commands. The version request then waits until Alice's existing stream ends and answers v2. Bob's version request would not wait on Alice.
+While the stream runs, publish v2 from another terminal. After Alchemy Done, request `/u/alice/version`. It waits for Alice's old stream to finish, then responds with v2. Bob's requests do not wait on Alice.
 
-```sh
-npm run deploy -- v2
-curl 'http://127.0.0.1:18743/u/alice/version'
-curl 'http://127.0.0.1:18743/u/alice/stream?n=3&ms=100'
-```
+## Limits and Safety
 
-PORT overrides the manual server port. `npm run deploy -- v2` edits the imported `facet-version.ts` stack input and requests reconciliation. It no longer bundles, uploads, or calls HTTP endpoints itself. It changes a comment as well, so even the same label triggers a fresh plan for source-only edits; that comment is not part of the facet bundle or Action inputs. Keep the Alchemy dev terminal running and wait for its Done message before querying the new version. A request is not a confirmation that deployment succeeded. Version changes do not alter the supervisor Worker's bundle, so its local provider stays noop and active streams survive the stack reload.
+Keep the runtime server on loopback and do not tunnel it. Only trusted local code should publish facets. The dynamic worker receives only its hash, no R2, KV, or namespace bindings, and has `globalOutbound = null`. These restrictions do not make this prototype a hardened multi-tenant sandbox.
 
-`alchemy.run.ts` calls `bundleFacet` and `publishFacet` from `infra/facet.ts`. `alchemy/Bundle.build` uses Alchemy's existing rolldown abstraction to build a single ESM module from `src/app.ts` with the version embedded. Its file-level SHA-256 addresses `code/<hash>.js`; the aggregate bundle hash is deliberately not used. The hash goes to the dynamic worker as env.HASH rather than being embedded in its own bundle, avoiding a self-referential content hash.
+Actions diff inputs rather than checking for storage drift. Deleting emulator data independently of Alchemy state requires a forced reconciliation. Old R2 code objects are retained for Supervisors that have not updated.
 
-Publication is two built-in `Alchemy.Action` graph nodes. FacetCode writes the module through `Cloudflare.R2.WriteBucketLocal`; FacetLatest takes the successful upload's hash output and writes KV through `Cloudflare.KV.WriteNamespaceLocal`. That output edge prevents publishing a pointer before its object exists. Both clients recognize locally emulated resource IDs and use Alchemy's scoped platform-proxy gateways into the same `.alchemy/local` storage as the Worker. No Cloudflare credentials or custom gateway are needed.
-
-The installed beta.83 has no R2 object or KV value lifecycle resources, so these small Action bodies fill that gap without a custom Resource or Provider. Alchemy persists and diffs their resolved inputs. A stack evaluation still bundles the source to discover changes, but identical module bytes skip the R2 upload and identical hash/version inputs skip the KV write. Actions do not read for drift or delete artifacts; old code objects remain available for supervisors that have not updated. If emulator data is removed independently of state, a forced reconciliation is needed. `--force` intentionally reruns Actions.
-
-This is stack-driven publishing, not a separate facet source watcher. Changing `facet-version.ts` triggers reconciliation. After editing only facet source, run `npm run deploy -- <label>` to trigger another evaluation, or restart dev. Repeating the same label leaves the artifact hash unchanged unless the emitted code changed.
-
-Alchemy beta.83 already has a native WorkerLoader() binding and native local Worker Loader support. Its API calls the DO namespace declaration DurableObject(), rather than DurableObjectNamespace(). No raw binding passthrough, plain Wrangler fallback, or custom workerd launcher was needed.
-
-The one runtime workaround is an npm override. Alchemy beta.83's cloudflare-runtime pins workerd 1.20261002.1. This project pins and overrides it to 1.20261021.1 for current facets support, without modifying node_modules. The checked-in lockfile captures that exact tested runtime. npm did not have a beta dist-tag when checked; latest was 2.0.0-beta.83, while next pointed at older beta.72. The project pins beta.83 explicitly.
-
-The old PUT /__local/code and PUT /__local/latest endpoints are removed. GET /__local/publication is read-only diagnostics for the latest hash, KV publication metadata, and R2 upload timestamp. GET /u/<user>/__status bypasses admission so the test can observe a drain. These diagnostic routes are local-only conveniences, not production authentication boundaries.
-
-Keep the dev server on loopback. Do not expose or tunnel it. Only trusted local stack code should publish facets; this intentionally executes the bundled code. Dynamic code receives no R2, KV, or namespace binding and has globalOutbound=null, but this is a prototype, not a hardened multi-tenant service. The in-memory queue and inflight tracking are not durable across Supervisor crashes. Pending/current and facet SQLite data are persistent, not active connections. Errors propagate rather than falling back to old code. Local KV does not model production KV propagation delay.
-
-npm audit reports advisories in Alchemy's transitive dependencies, including Prisma's Hono-related tree and lodash; these were not force-upgraded or claimed fixed. No Prisma service or Hono application is part of this prototype. Review dependencies before adapting this for production.
-
-Reference documentation is at https://alchemy.run/environments/local-development and https://alchemy.run/cloudflare/compute/worker-loader and https://developers.cloudflare.com/dynamic-workers/usage/durable-object-facets/ . The installed Alchemy sources for Workers/WorkerLoader.ts, Workers/RuntimeBindings.ts, Workers/DurableObject.ts, R2/Bucket.ts, KV/Namespace.ts, and State/LocalState.ts were also checked.
-
-The publication implementation was checked against the installed `alchemy/src/Bundle/Bundle.ts`, `Action.ts`, `Cloudflare/R2/WriteBucketLocal.ts`, `Cloudflare/R2/LocalR2Gateway.ts`, `Cloudflare/KV/WriteNamespaceLocal.ts`, and `Cloudflare/KV/LocalKVGateway.ts`. The custom-provider lifecycle and local-provider routes were also checked before choosing the simpler Actions abstraction. References are https://alchemy.run/infrastructure-as-code/action/ , https://alchemy.run/infrastructure-as-code/custom-provider/ , https://alchemy.run/infrastructure-as-code/local-provider/ , and https://github.com/alchemy-run/alchemy/blob/main/packages/alchemy/src/Bundle/Bundle.ts .
-
-The layout keeps runtime and deployment separate. `src/` contains only Worker and facet runtime code; its stack dependency is type-only for inferred bindings. `infra/` contains bundling and publication Effects used by `alchemy.run.ts`. `scripts/` contains CLI entrypoints only and is never imported by runtime or stack code. `test/` contains integration tests. `facet-version.ts` is the manual stack input.
-
-Run `npm run lint` for Oxlint correctness rules and import-boundary checks.
-`npm run fmt` formats the project with Oxfmt; `npm run fmt:check` checks without
-writing. Both tools ignore local emulator data and audit output. The formatter
-also ignores the generated version input and npm's lockfile.
-
-Typechecking uses the native TypeScript 7 compiler (`typescript@7.0.2`). Its
-package still exposes the `tsc` command, so `npm run check` runs TS7, not the
-legacy JavaScript compiler. `@effect/tsgo` supplies Effect diagnostics; the
-`prepare` hook runs `effect-tsgo patch` after installation. The plugin name in
-`tsconfig.json` remains `@effect/language-service`, as required by Effect's
-TS7 integration; the old package is no longer installed. Typechecking reports
-Effect diagnostics for runtime, stack, and infrastructure alongside ordinary
-type errors. Oxlint handles correctness and import boundaries separately.
-Select the workspace TypeScript version in your editor to use the patched compiler.
-The TypeScript and import-boundary checks are deliberately separate from formatting.
-
-Tool setup follows https://oxc.rs/docs/guide/usage/linter/config ,
-https://oxc.rs/docs/guide/usage/formatter/config , and
-https://effect.website/docs/v4/getting-started/devtools and
-https://github.com/Effect-TS/tsgo . The native Alchemy Vitest adapter
-was verified against the installed beta.83 implementation in
-`alchemy/src/Test/Vitest.ts`, including its cleanup hooks.TypeScript 7.0.2 is an explicit development dependency. Effect's official
-native integration, `@effect/tsgo` 0.53.4, replaces the old JavaScript
-`@effect/language-service` package. Its setup command retains the
-`@effect/language-service` plugin configuration key and adds the native
-configuration schema in `tsconfig.json`. The recommended `prepare` hook runs
-`effect-tsgo patch --typescript --no-oxlint` after installation, replacing the
-local native compiler with the matching Effect-enabled build. Consequently,
-`npm run check` uses TypeScript 7 and reports build-time Effect diagnostics,
-not just editor hints. No removed compiler options needed changing.
-
-For editor diagnostics, configure the editor to use `effect-tsgo` as its sole
-TypeScript language server, not a second server alongside stock TypeScript.
-See https://github.com/Effect-TS/tsgo for editor setup. Unlike the old plugin,
-selecting a workspace JavaScript TypeScript version alone is not sufficient.
-
-The pinned Effect integration explicitly supports TypeScript 7.0.2 and Oxlint
-1.88.0. Upgrade it together with TypeScript when the native compiler changes;
-its replacement binaries are version-specific. Oxlint remains syntax-based
-correctness and boundary linting here, with no experimental type-aware patch.
-Oxfmt and Vitest need no TypeScript compiler plugin. The TypeScript and
-import-boundary checks are deliberately separate from formatting.
-
-Alchemy's transitive `capnp-es` 0.0.16 declares an optional TypeScript peer
-range that stops at version 6. A fresh `npm ci`, native typecheck, and the
-local runtime integration test pass, but `npm ls typescript` still reports
-that optional peer mismatch. This prototype uses its serialization runtime,
-not its TypeScript-generating compiler. No peer override or forced dependency
-upgrade is applied.
-
-Tool setup follows https://oxc.rs/docs/guide/usage/linter/config ,
-https://oxc.rs/docs/guide/usage/formatter/config , and
-https://effect.website/docs/v4/getting-started/devtools and
-https://github.com/Effect-TS/tsgo . The native Alchemy Vitest adapter
-was verified against the installed beta.83 implementation in
-`alchemy/src/Test/Vitest.ts`, including its cleanup hooks.
+Local KV does not reproduce production propagation delay. Queue limits, crash-safe request recovery, WebSockets, production authentication, source-map publication, billing validation, and production rollout are outside this prototype. Load and application errors propagate; there is no fallback to old code.
