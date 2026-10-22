@@ -217,7 +217,7 @@ The old writable publication endpoints return 404. Read-only publication and Sup
 
 ## Running the Demo
 
-With Node, npm, and Bun available, install dependencies and run the checks.
+Use Node 24.11.1+ (or 25.1+) and npm. The dev command runs the project-local Alchemy CLI under Node, using its Oxc loader for the TypeScript stack. Install dependencies and run the checks.
 
 ```sh
 npm ci
