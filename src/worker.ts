@@ -1,5 +1,15 @@
 import type { Env } from "../alchemy.run";
 
+export { ScopedNotes } from "./notes";
+
+declare global {
+  namespace Cloudflare {
+    interface GlobalProps {
+      mainModule: typeof import("./worker");
+    }
+  }
+}
+
 export { Supervisor } from "./supervisor";
 
 export default {

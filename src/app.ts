@@ -1,15 +1,33 @@
 import { DurableObject } from "cloudflare:workers";
 
+import type { ScopedNotes } from "./notes";
+
 declare const VERSION: string;
 
-export class App extends DurableObject<{ HASH: string }> {
-  fetch(request: Request): Response {
+export class App extends DurableObject<{ HASH: string; NOTES: Service<ScopedNotes> }> {
+  async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     // Facet state lives only in its SQLite-backed storage, which survives abort.
     const served = this.ctx.storage.kv.get<number>("served") ?? 0;
 
     if (url.pathname === "/version") {
       return Response.json({ v: VERSION, hash: this.env.HASH, served });
+    }
+    if (url.pathname === "/notes") {
+      const key = url.searchParams.get("key") ?? "note";
+      try {
+        if (request.method === "PUT") {
+          await this.env.NOTES.put(key, await request.text());
+        } else if (request.method !== "GET") {
+          return new Response("Method not allowed", { status: 405 });
+        }
+        return Response.json({
+          value: await this.env.NOTES.get(key),
+          gateway: await this.env.NOTES.revision(),
+        });
+      } catch (error) {
+        return new Response(String(error), { status: 403 });
+      }
     }
     if (url.pathname !== "/stream") return new Response("Not found", { status: 404 });
 

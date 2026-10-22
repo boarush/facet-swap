@@ -118,7 +118,7 @@ test.provider(
         });
         await until(async () => {
           const status = await get("/u/" + a + "/__status");
-          return status.pending === v2 && status.queued === 1 && status.inflight === 1;
+          return status.pending?.hash === v2 && status.queued === 1 && status.inflight === 1;
         });
         assert.equal(queuedResolved, false);
         pass("request during drain is queued, active stream still counted");
