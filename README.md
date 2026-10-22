@@ -10,9 +10,9 @@ This is a demonstration of controlled code replacement, not a guarantee against 
 
 The entry Worker routes `/u/<user>/stream` and `/u/<user>/version` to a Supervisor selected by `idFromName(user)`. Each Supervisor owns a facet named `app`.
 
-The **Supervisor** has stable code. It handles admission, tracks response lifetimes, and persists the current and pending content hashes in its own SQLite-backed storage.
+The **Supervisor** has stable code. It handles admission, tracks response lifetimes, and persists the current and pending configurations in its own SQLite-backed storage.
 
-The **Facet** contains the application logic. Worker Loader loads its module by content hash from R2. The facet has a separate SQLite database, preserved when the Supervisor aborts and recreates it. Its version label is compiled into the module; its hash is passed as `env.HASH`, avoiding a self-referential hash.
+The **Facet** contains the application logic. Worker Loader loads its module by content hash from R2. The facet has a separate SQLite database, preserved when the Supervisor aborts and recreates it. Its version label is compiled into the module; its hash is passed as `env.HASH`, avoiding a self-referential hash. Its only resource access is a scoped `env.NOTES` service stub, not a raw storage binding.
 
 ### Architecture
 
@@ -25,6 +25,10 @@ flowchart TB
     S --- SD[(Supervisor SQLite)]
     F --- FD[(Facet SQLite)]
   end
+  S -->|specialize loopback with user and permissions| N[ScopedNotes entrypoint in entry Worker]
+  N -->|GATEWAY service binding| G[Separate gateway Worker]
+  F -->|NOTES RPC stub| N
+  G -->|owns raw binding| NOTES[(R2 notes)]
   S -.->|lazy read latest| KV[(KV latest hash)]
   S -->|get by content hash| L[Worker Loader]
   L -->|read module on load| R2[(R2 code/hash.js)]
@@ -35,6 +39,28 @@ flowchart TB
   U -->|successful hash output| P[FacetLatest Action]
   P -->|publish latest| KV
 ```
+
+## Capabilities Instead of Raw Bindings
+
+The gateway Worker owns the Notes R2 bucket and exports an unscoped `Notes` entrypoint with `get`, `put`, and a revision diagnostic. Its default HTTP handler always returns 404. Only the trusted entry Worker receives the unscoped `GATEWAY` service binding; the Supervisor's user identity comes from its Durable Object ID, never facet input.
+
+The entry Worker exports a thin `ScopedNotes` entrypoint. The Supervisor specializes its loopback binding with immutable `{ user, readOnly }` props and passes the resulting service stub into the facet's loader env. `ScopedNotes` prefixes every key with that user ID, accepts only opaque alphanumeric/underscore/hyphen keys, and checks write permission. The facet can call `get(key)` and `put(key, value)`, but cannot choose another prefix, alter props, mint a new stub, or reach the unscoped gateway. `GET/PUT /u/<user>/notes?key=note` exercises these calls from inside the facet.
+
+Regular cross-worker service bindings accept **deployment-time** props, not caller-selected runtime props. The [Context documentation](https://developers.cloudflare.com/workers/runtime-apis/context/#specifying-ctxprops-when-using-ctxexports) explicitly reserves runtime specialization for loopback bindings. This is also visible in [workerd's implementation](https://github.com/cloudflare/workerd/blob/v1.20260918.1/src/workerd/server/server.c++#L4114-L4123): the loopback template can specialize once; an already-specialized service rejects overrides. Consequently, this sketch uses the same-worker forwarding entrypoint rather than the invalid `env.GATEWAY.Notes({ props })` shape. The local runtime test exercises actual props serialization into loader env, not mocks.
+
+The loader cache key includes the code hash, user ID, and permission. Caching solely by hash would reuse another user's frozen env, a capability leak even if the underlying module bytes are identical.
+
+### Refreshing Scope
+
+The trusted local control route `PUT /u/<user>/__scope` with JSON `{"readOnly":true}` stages a new configuration with the **same hash**. Current and pending configurations include both hash and permission. Scope refresh closes admission, waits for inflight bodies to finish, and uses the existing abort/recreate path. Recreated F receives the new scoped stub; its SQLite state survives. A revocation therefore takes effect **after draining**, not immediately, and a stream that never ends delays it indefinitely.
+
+The scope route never reaches the facet. It is unauthenticated local test machinery, not a production authorization API. User routes themselves also lack authentication; this proves confinement of a facet's supplied capability, not protection against a client choosing another user's URL. No capability may be retained/shared outside the request-lifetime model if scope revocation is meant to be reliable.
+
+### Gateway Deployment Boundary
+
+Adding or changing real resources belongs on the gateway, not the Supervisor. The forwarding API must remain compatible; adding entirely new capability methods still requires teaching the trusted forwarding entrypoint how to expose them. This is a small concrete sketch, not a generic capability broker.
+
+There is a verified **local-provider limitation** in Alchemy beta.83. Changing only the gateway's revision restarts Gateway while Api logs "No changes, using existing instance". The Supervisor's open stream survives, but its existing service channel continues reporting the old gateway revision. The integration test records this explicitly; it does **not** prove that gateway redeployments become visible without restarting Api. Do not treat local success as a production rollout guarantee. A production service-binding deployment test remains outstanding.
 
 ## Publishing Is Part of the Stack
 
@@ -120,7 +146,7 @@ sequenceDiagram
 
 ## State and Forward-Only Changes
 
-Current and pending hashes are durable; the queue, inflight count, and active connections are not. Persisting current before abort lets a restarted Supervisor select the intended code, but a Supervisor crash can still lose waiting requests and open streams.
+Current and pending code/scope configurations are durable; the queue, inflight count, and active connections are not. Persisting current before abort lets a restarted Supervisor select the intended code, but a Supervisor crash can still lose waiting requests and open streams.
 
 Application state belongs in the facet's SQLite database. The demo writes a served counter before starting each stream, once per stream rather than once per event. The counter survives code replacement.
 
@@ -134,7 +160,7 @@ There is no rollback or canary path. A faulty release is corrected by publishing
 
 `infra/` holds the facet bundle and publication Effects used by the stack. `scripts/` contains only the deploy CLI. `test/` contains the Vitest integration test. `facet-version.ts` is the manual stack input.
 
-Binding types come from `Env = InferEnv<typeof worker>` in `alchemy.run.ts`. Runtime modules import that type only, so stack code stays out of the Worker bundle.
+Binding types come from `Env = InferEnv<typeof worker>` and `GatewayEnv = InferEnv<ReturnType<typeof gatewayWorker>>` in `alchemy.run.ts`. Runtime modules import that type only, so stack code stays out of the Worker bundle.
 
 Oxlint enforces correctness rules and import boundaries. Runtime cannot import infrastructure, scripts, or tests, and its imports from `alchemy.run` must be type-only. Runtime and infrastructure cannot import CLI entrypoints or tests. Oxfmt handles formatting separately.
 
@@ -148,7 +174,7 @@ Vitest uses Alchemy's native `alchemy/Test/Vitest` adapter, a real local-provide
 
 The test deploys v1 twice and checks that the actual R2 upload time and KV publication metadata are unchanged. It then publishes v2 during a stream, observes a queued request through local diagnostics, and verifies all 25 old events remain v1. The queued response and a fresh stream use v2, and the facet counter survives. A second user's Supervisor updates independently. Publishing v3 and cancelling an active body verifies cancellation releases the gate.
 
-The old writable publication endpoints return 404. Only read-only publication and Supervisor-status diagnostics remain.
+The old writable publication endpoints return 404. Read-only publication and Supervisor-status diagnostics remain, alongside the trusted local scope-control route. The test additionally checks actual facet RPC reads/writes, isolation between Alice and Bob with the same code hash, path-escape rejection, gateway-redeploy behavior (including the pinned local channel limitation), and read-only scope refresh during an active stream.
 
 ## Running the Demo
 
@@ -179,7 +205,7 @@ While the stream runs, publish v2 from another terminal. After Alchemy Done, req
 
 ## Limits and Safety
 
-Keep the runtime server on loopback and do not tunnel it. Only trusted local code should publish facets. The dynamic worker receives only its hash, no R2, KV, or namespace bindings, and has `globalOutbound = null`. These restrictions do not make this prototype a hardened multi-tenant sandbox.
+Keep both runtime servers on loopback and do not tunnel them. Only trusted local code should publish facets. The dynamic worker receives only its hash and a scoped Notes service stub, no raw R2, KV, or namespace bindings, and has `globalOutbound = null`. These restrictions do not make this prototype a hardened multi-tenant sandbox.
 
 Actions diff inputs rather than checking for storage drift. Deleting emulator data independently of Alchemy state requires a forced reconciliation. Old R2 code objects are retained for Supervisors that have not updated.
 
