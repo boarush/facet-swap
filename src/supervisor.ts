@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../alchemy.run";
+import { createRouter } from "./router";
 import { loadApp, VersionSource } from "./version-source";
 import { trackResponseBody, type UpdateAbort } from "./stream-lifetime";
 
@@ -25,42 +26,48 @@ export class Supervisor extends DurableObject<Env> {
     this.swapWhenIdle();
   }
 
-  async fetch(request: Request): Promise<Response> {
-    // Local diagnostics bypass admission so tests can observe a drain.
-    if (new URL(request.url).pathname === "/__status") {
-      return Response.json({
+  private readonly router = createRouter<Env>()
+    // Local diagnostics bypass update checks and admission.
+    .all("/__status", () =>
+      Response.json({
         ...this.state,
         inflight: this.active.size,
         swapping: this.swapping,
-      });
-    }
-
-    await this.checkForUpdate();
+      }),
+    )
+    .use(async (_c, next) => {
+      await this.checkForUpdate();
+      await next();
+    })
     // Local trusted control plane only; never forward scope requests to the facet.
-    if (new URL(request.url).pathname === "/__scope") {
-      if (request.method !== "PUT") return new Response("Method not allowed", { status: 405 });
-      const body = await request.json<{ readOnly?: unknown }>();
+    .put("/__scope", async (c) => {
+      const body = await c.req.raw.json<{ readOnly?: unknown }>();
       if (typeof body.readOnly !== "boolean") return new Response("Invalid scope", { status: 400 });
       const target = this.state.pending ?? this.state.current;
       if (!target) return new Response("Publish a version first", { status: 503 });
       this.stage({ ...target, readOnly: body.readOnly });
       return Response.json({ accepted: true });
-    }
-    // Close admission while pending so new traffic cannot starve the update.
-    if (this.state.pending) {
+    })
+    .all("/__scope", () => new Response("Method not allowed", { status: 405 }))
+    .all("*", (c) => {
       // Clients own retries; never retain requests while old bodies drain.
-      return new Response("Update pending; retry later", {
-        status: 503,
-        headers: {
-          "Retry-After": "1",
-          "X-Current-Version": this.state.current?.hash ?? "",
-          "X-Pending-Version": this.state.pending.hash,
-          "Cache-Control": "no-store",
-        },
-      });
-    }
-    if (!this.state.current) return new Response("Publish a version first", { status: 503 });
-    return this.serve(request);
+      if (this.state.pending) {
+        return new Response("Update pending; retry later", {
+          status: 503,
+          headers: {
+            "Retry-After": "1",
+            "X-Current-Version": this.state.current?.hash ?? "",
+            "X-Pending-Version": this.state.pending.hash,
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+      if (!this.state.current) return new Response("Publish a version first", { status: 503 });
+      return this.serve(c.req.raw);
+    });
+
+  async fetch(request: Request): Promise<Response> {
+    return this.router.fetch(request, this.env);
   }
 
   // Keep the logical due time separate from the physical alarm's drain deferrals.
