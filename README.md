@@ -52,7 +52,7 @@ The loader cache key includes the code hash, user ID, and permission. Caching so
 
 ### Refreshing Scope
 
-The trusted local control route `PUT /u/<user>/__scope` with JSON `{"readOnly":true}` stages a new configuration with the **same hash**. Current and pending configurations include both hash and permission. Scope refresh closes admission, waits for inflight bodies to finish, and uses the existing abort/recreate path. Recreated F receives the new scoped stub; its SQLite state survives. A revocation therefore takes effect **after draining**, not immediately, and a stream that never ends delays it indefinitely.
+The trusted local control route `PUT /u/<user>/__scope` with JSON `{"readOnly":true}` stages a new configuration with the **same hash**. Current and pending configurations include both hash and permission. Scope refresh closes admission with the same 503 retry response as a code update, waits for inflight bodies to finish, and uses the existing abort/recreate path. Both version headers carry the same hash during a scope-only drain. Recreated F receives the new scoped stub; its SQLite state survives. A revocation therefore takes effect **after draining**, not immediately, and a stream that never ends delays it indefinitely.
 
 The scope route never reaches the facet. It is unauthenticated local test machinery, not a production authorization API. User routes themselves also lack authentication; this proves confinement of a facet's supplied capability, not protection against a client choosing another user's URL. No capability may be retained/shared outside the request-lifetime model if scope revocation is meant to be reliable.
 
@@ -96,23 +96,25 @@ Keep the dev process running and wait for Alchemy's **Done** message before quer
 
 **Notice.** On incoming requests, each Supervisor reads KV `latest` at most once every `CHECK_INTERVAL_MS`, which defaults to 10,000 milliseconds. Concurrent checks share a promise. There are no alarms, background polling, or update pushes. An idle object checks when traffic returns and its interval permits.
 
-**Drain.** If the hash differs from the current and pending hashes, the Supervisor persists it as pending. New requests wait in an in-memory queue. Requests already admitted continue on the old facet.
+**Drain.** If the hash differs from the current and pending hashes, the Supervisor persists it as pending. New application requests immediately receive **503 Service Unavailable**; the Supervisor never queues or forwards them. Requests already admitted continue on the old facet.
+
+The response includes `Retry-After: 1`, `X-Current-Version`, `X-Pending-Version`, and `Cache-Control: no-store`. Version headers contain content hashes, not labels such as v1. Clients should wait at least the indicated seconds and add jitter before retrying, with a retry budget or cancellation policy. A 503 from this gate means the request did not reach the facet; other failures do not carry that guarantee. Local status and scope-control routes bypass application admission.
 
 A request remains inflight until its response body reaches EOF, errors, or is cancelled. A `TransformStream` pipe tracks that lifetime; receiving response headers alone does not release the request.
 
 **Swap.** Only at zero inflight does the Supervisor synchronously persist `current = pending`, clear pending, and abort the named `app` facet. Aborting does not delete the facet's SQLite storage. The next facet lookup loads the new App class using the current content hash.
 
-**Resume.** Queued requests are served by the new facet. A long stream delays only its own user's update. There is no drain deadline or forced swap; an indefinitely open stream blocks that user's update indefinitely.
+**Retry.** After the swap, a new client attempt is served by the new facet. A long stream delays only its own user's update; other users can still make progress. There is no drain deadline or forced swap; an indefinitely open stream leaves that user's new application requests receiving 503 indefinitely. Moving retries to clients avoids retaining waiting requests, but does not shorten the drain.
 
 ### Supervisor Lifecycle
 
 ```mermaid
 stateDiagram-v2
   [*] --> Running
-  Running --> Draining: different hash noticed and persisted
-  Draining --> Draining: existing bodies finish, arrivals queue
+  Running --> Draining: new code or scope persisted
+  Draining --> Draining: existing bodies finish, arrivals get 503
   Draining --> Swapping: inflight is zero
-  Swapping --> Running: persist current, abort app, release queue
+  Swapping --> Running: persist current, abort app, reopen admission
 ```
 
 When already idle, the Supervisor can swap immediately without spending time draining.
@@ -135,18 +137,21 @@ sequenceDiagram
   B->>S: GET /version
   S->>KV: eligible lazy check
   KV-->>S: H2
-  Note over S: persist pending H2, queue B
+  Note over S: persist pending H2, close admission
+  S-->>B: 503, Retry-After 1, current H1, pending H2
+  Note over B: wait Retry-After plus jitter
   F-->>A: final v1 event and EOF
   Note over S: inflight zero, persist current H2
   S->>F: abort app, preserve SQLite
   Note over S,F: next get loads App class for H2
-  S->>F: serve queued B
+  B->>S: retry GET /version
+  S->>F: serve new attempt
   F-->>B: v2 and existing served counter
 ```
 
 ## State and Forward-Only Changes
 
-Current and pending code/scope configurations are durable; the queue, inflight count, and active connections are not. Persisting current before abort lets a restarted Supervisor select the intended code, but a Supervisor crash can still lose waiting requests and open streams.
+Current and pending code/scope configurations are durable; the inflight count and active connections are not. There is no waiting-request queue. Persisting current before abort lets a restarted Supervisor select the intended code, but a Supervisor crash can still lose open streams. Retry scheduling belongs to clients, not Supervisor memory.
 
 Application state belongs in the facet's SQLite database. The demo writes a served counter before starting each stream, once per stream rather than once per event. The counter survives code replacement.
 
@@ -172,9 +177,9 @@ Alchemy is pinned to beta.83, with an npm override to workerd 1.20261021.1 for t
 
 Vitest uses Alchemy's native `alchemy/Test/Vitest` adapter, a real local-provider sidecar, an isolated stage, and a random loopback port. The adapter owns server cleanup and scratch-stack destruction. Its test watchdog is not a Supervisor drain timeout.
 
-The test deploys v1 twice and checks that the actual R2 upload time and KV publication metadata are unchanged. It then publishes v2 during a stream, observes a queued request through local diagnostics, and verifies all 25 old events remain v1. The queued response and a fresh stream use v2, and the facet counter survives. A second user's Supervisor updates independently. Publishing v3 and cancelling an active body verifies cancellation releases the gate.
+The test deploys v1 twice and checks that the actual R2 upload time and KV publication metadata are unchanged. It then publishes v2 during a stream, checks that a new request immediately receives 503 with retry and current/pending hash headers while the old body remains inflight, and verifies all 25 old events remain v1. A retry after draining and a fresh stream use v2, and the facet counter survives. A second user's Supervisor updates independently. Publishing v3 and cancelling an active body verifies cancellation releases inflight and permits a successful retry.
 
-The old writable publication endpoints return 404. Read-only publication and Supervisor-status diagnostics remain, alongside the trusted local scope-control route. The test additionally checks actual facet RPC reads/writes, isolation between Alice and Bob with the same code hash, path-escape rejection, gateway-redeploy behavior (including the pinned local channel limitation), and read-only scope refresh during an active stream.
+The old writable publication endpoints return 404. Read-only publication and Supervisor-status diagnostics remain, alongside the trusted local scope-control route. The test additionally checks actual facet RPC reads/writes, isolation between Alice and Bob with the same code hash, path-escape rejection, gateway-redeploy behavior (including the pinned local channel limitation), and read-only scope refresh during an active stream. Scope-only drains reject writes with 503 and equal current/pending hash headers; after draining, retried writes receive 403 under the new permission. Bob can still write during Alice's scope drain.
 
 ## Running the Demo
 
@@ -201,7 +206,7 @@ npm run deploy -- v1
 curl -N 'http://127.0.0.1:18743/u/alice/stream?n=20&ms=500'
 ```
 
-While the stream runs, publish v2 from another terminal. After Alchemy Done, request `/u/alice/version`. It waits for Alice's old stream to finish, then responds with v2. Bob's requests do not wait on Alice.
+While the stream runs, publish v2 from another terminal. After Alchemy Done, request `/u/alice/version`. It immediately returns 503 with retry and version headers while Alice's old stream is active. Wait at least one second plus a little jitter, then retry; once the stream finishes and the swap completes, the response contains v2. Bob's requests are unaffected by Alice's drain.
 
 ## Limits and Safety
 
@@ -209,4 +214,4 @@ Keep both runtime servers on loopback and do not tunnel them. Only trusted local
 
 Actions diff inputs rather than checking for storage drift. Deleting emulator data independently of Alchemy state requires a forced reconciliation. Old R2 code objects are retained for Supervisors that have not updated.
 
-Local KV does not reproduce production propagation delay. Queue limits, crash-safe request recovery, WebSockets, production authentication, source-map publication, billing validation, and production rollout are outside this prototype. Load and application errors propagate; there is no fallback to old code.
+Local KV does not reproduce production propagation delay. Crash-safe request recovery, WebSockets, production authentication, source-map publication, billing validation, and production rollout are outside this prototype. Load and application errors propagate; there is no fallback to old code.
