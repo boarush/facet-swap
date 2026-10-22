@@ -12,7 +12,7 @@ The entry Worker routes `/u/<user>/stream` and `/u/<user>/version` to a Supervis
 
 The **Supervisor** has stable code. It handles admission, tracks response lifetimes, and persists the current and pending configurations in its own SQLite-backed storage.
 
-The **Facet** contains the application logic. Worker Loader loads its module by content hash from R2. The facet has a separate SQLite database, preserved when the Supervisor aborts and recreates it. An optional manual label is compiled into the module as a salt; no label is needed for publication. Its hash is passed as `env.HASH`, avoiding a self-referential hash. Both `/version` and SSE events show a 12-character hash in `v`, the full `hash`, and a `label` only when one is set. Its only resource access is a scoped `env.NOTES` service stub, not a raw storage binding.
+The **Facet** contains the application logic. Worker Loader loads its module by content hash from R2. The facet has a separate SQLite database, preserved when the Supervisor aborts and recreates it. An optional manual label is compiled into the module as a salt; no label is needed for publication. Its hash is passed as `env.HASH`, avoiding a self-referential hash. Both `/version` and SSE events show a 12-character hash in `v`, the full `hash`, and a `label` only when one is set. It receives scoped `env.NOTES` and `env.SCHEDULER` service stubs, not raw resource bindings.
 
 ### Architecture
 
@@ -28,6 +28,9 @@ flowchart TB
   S -->|specialize loopback with user and permissions| N[ScopedNotes entrypoint in entry Worker]
   N -->|GATEWAY service binding| G[Separate gateway Worker]
   F -->|NOTES RPC stub| N
+  F -->|SCHEDULER RPC stub| A[Scheduler loopback entrypoint]
+  A -->|fixed Supervisor identity| S
+  S -.->|native alarm invokes facet handler| F
   G -->|owns raw binding| NOTES[(R2 notes)]
   S -.->|lazy read latest| KV[(KV latest hash)]
   S -->|get by content hash| L[Worker Loader]
@@ -98,7 +101,7 @@ Keep the dev process running and wait for Alchemy's **Done** message before quer
 
 ## How a Supervisor Updates
 
-**Notice.** On incoming requests, each Supervisor reads KV `latest` at most once every `CHECK_INTERVAL_MS`, which defaults to 10,000 milliseconds. Concurrent checks share a promise. There are no alarms, background polling, or update pushes. An idle object checks when traffic returns and its interval permits.
+**Notice.** On incoming requests and application alarm deliveries, each Supervisor reads KV `latest` at most once every `CHECK_INTERVAL_MS`, which defaults to 10,000 milliseconds. Concurrent checks share a promise. There is no background update polling or update push. An idle object checks when traffic returns or its application alarm fires, and its interval permits.
 
 **Drain.** If the hash differs from the current and pending hashes, the Supervisor persists it as pending. New application requests immediately receive **503 Service Unavailable**; the Supervisor never queues or forwards them. Requests already admitted continue on the old facet.
 
@@ -164,11 +167,25 @@ sequenceDiagram
   F-->>B: v2 and existing served counter
 ```
 
+## Alarms Through the Supervisor
+
+Facets cannot own native alarms. The Supervisor supplies `env.SCHEDULER`, a loopback service stub with `setAlarm(time: number | Date)`, `getAlarm()`, and `deleteAlarm()`. Like Notes, its immutable props fix the Supervisor identity; the facet cannot select another object or obtain its raw namespace/stub. There is one logical alarm per Supervisor. Setting another time replaces it, and deleting cancels it.
+
+The due time and a unique scheduling token live in the Supervisor's SQLite-backed storage. Setting/deleting that record and the native storage alarm share a transaction. Neither a code/scope swap nor Supervisor reconstruction resets the schedule. `getAlarm()` reports the logical due time, even when the physical alarm was postponed for draining; while that delivery is executing it returns null unless the handler has scheduled a replacement. Tokens keep a handler's rearm safe even when it uses the same timestamp.
+
+When the native `Supervisor.alarm()` fires, it performs the usual interval-limited KV check before loading F. Pending drains postpone the physical alarm by two seconds without consuming the logical alarm or extending the hard drain timer. After swapping, the next delivery loads current code. Executing handlers count as inflight work, so a code/scope change drains them just like requests. A deadline abort rejects the old handler and leaves its durable alarm record for retry. On Supervisor restart, pending configurations commit immediately as before; native alarm persistence/retries recover delivery, not the in-memory drain timer.
+
+Cloudflare reserves `alarm` on Durable Object RPC stubs. A tiny `F.dispatchAlarm(info)` bridge therefore invokes `F.alarm(info)`. The Supervisor copies the runtime's non-serializable invocation metadata into a plain object, preserving the logical scheduled time and native retry information.
+
+Errors propagate to the native alarm handler, using [Cloudflare's at-least-once retries](https://developers.cloudflare.com/durable-objects/api/alarms/) rather than a custom retry loop. Handlers **must be idempotent**: aborts or failures can repeat effects that already completed. Native retries use exponential backoff starting at two seconds, with up to six retries for the most recent `setAlarm`; this is not unlimited delivery. A logical record can remain after retry exhaustion and needs explicit rearming. Rearming/deleting during a handler follows native replacement/cancellation semantics; cancellation does not undo running work.
+
+The demo's `GET/PUT/DELETE /u/<user>/alarm` calls the scheduler from inside F. PUT accepts JSON `{"time": <epoch milliseconds>}`. GET reports `scheduled`, the facet's persistent firing `count`, and `last` with the handling code hash. These routes have the same local-only, unauthenticated status as the rest of this demo.
+
 ## State and Forward-Only Changes
 
 Current and pending code/scope configurations are durable; active requests and the timer are not. There is no waiting-request queue. Persisting current before abort lets a restarted Supervisor select the intended code. A pending configuration recovered on wake is committed immediately because there is no recoverable inflight set to drain. A Supervisor crash can still lose open streams without a final abort event. Retry scheduling belongs to clients, not Supervisor memory.
 
-Application state belongs in the facet's SQLite database. The demo writes a served counter before starting each stream, once per stream rather than once per event. The counter survives code replacement.
+The application alarm schedule belongs to Supervisor storage; handler effects belong to the facet. Application state belongs in the facet's SQLite database. The demo writes a served counter before starting each stream, once per stream rather than once per event. The counter survives code replacement.
 
 For a real long-running application, the **facet itself** must checkpoint meaningful work periodically. The Supervisor does not provide automatic checkpoints. This demo persists its counter, but does not implement resumable stream checkpoints or a migration framework. Application migrations should be repeatable and compatible with forward-only updates.
 
@@ -194,7 +211,7 @@ Vitest uses Alchemy's native `alchemy/Test/Vitest` adapter, a real local-provide
 
 The test first deploys without a manual label and checks the short-hash display. It changes only application source under a fixed label and verifies publication and a swap in an existing Supervisor, then redeploys unchanged source to check the no-op. Label-only updates exercise publication and swapping without changing application source. The test also deploys v1 twice and checks that the actual R2 upload time and KV publication metadata are unchanged. It then publishes v2 during a stream, checks that a new request immediately receives 503 with retry and current/pending hash headers while the old body remains inflight, and verifies all 25 old events remain v1. A retry after draining and a fresh stream use v2, and the facet counter survives. A second user's Supervisor updates independently. Publishing v3 and cancelling an active body verifies cancellation releases inflight and permits a successful retry.
 
-The old writable publication endpoints return 404. Read-only publication and Supervisor-status diagnostics remain, alongside the trusted local scope-control route. The test additionally checks actual facet RPC reads/writes, isolation between Alice and Bob with the same code hash, path-escape rejection, gateway-redeploy behavior (including the pinned local channel limitation), and read-only scope refresh during an active stream. Scope-only drains reject writes with 503 and equal current/pending hash headers; after draining, retried writes receive 403 under the new permission. Bob can still write during Alice's scope drain. Long-stream tests exercise both code and scope deadlines, check the final abort event's old/new hashes, and verify that retries use the new code or permission. Wrapper unit tests cover EOF, cancellation, pending reads, and non-SSE aborts. An isolated CLI test checks that no-argument deploys preserve the salt file byte-for-byte, explicit arguments set it safely, and an empty argument clears it.
+The old writable publication endpoints return 404. Read-only publication and Supervisor-status diagnostics remain, alongside the trusted local scope-control route. The test additionally checks actual facet RPC reads/writes, isolation between Alice and Bob with the same code hash, path-escape rejection, gateway-redeploy behavior (including the pinned local channel limitation), and read-only scope refresh during an active stream. Scope-only drains reject writes with 503 and equal current/pending hash headers; after draining, retried writes receive 403 under the new permission. Bob can still write during Alice's scope drain. Long-stream tests exercise both code and scope deadlines, check the final abort event's old/new hashes, and verify that retries use the new code or permission. Wrapper unit tests cover EOF, cancellation, pending reads, and non-SSE aborts. Alarm integration cases exercise real scheduling, cancellation, getAlarm inside a handler, delivery after an alarm-driven code swap without intervening traffic, deferral through both normal and deadline drains, and native retry after a facet exception. Supervisor unit tests additionally cover rearming at the same timestamp, deletion during a failed delivery, stale physical callbacks, an inflight alarm interrupted by the hard deadline, and reconstruction with a persisted pending swap/alarm. These reconstruction tests model storage reuse; they do not simulate a real process crash. An isolated CLI test checks that no-argument deploys preserve the salt file byte-for-byte, explicit arguments set it safely, and an empty argument clears it.
 
 ## Running the Demo
 
@@ -225,7 +242,7 @@ While the stream runs, edit the facet source and run `npm run deploy` again. Or 
 
 ## Limits and Safety
 
-Keep both runtime servers on loopback and do not tunnel them. Only trusted local code should publish facets. The dynamic worker receives only its hash and a scoped Notes service stub, no raw R2, KV, or namespace bindings, and has `globalOutbound = null`. These restrictions do not make this prototype a hardened multi-tenant sandbox.
+Keep both runtime servers on loopback and do not tunnel them. Only trusted local code should publish facets. The dynamic worker receives only its hash and scoped Notes/scheduler service stubs, no raw R2, KV, or namespace bindings, and has `globalOutbound = null`. These restrictions do not make this prototype a hardened multi-tenant sandbox.
 
 Actions diff inputs rather than checking for storage drift. Deleting emulator data independently of Alchemy state requires a forced reconciliation. Old R2 code objects are retained for Supervisors that have not updated.
 
