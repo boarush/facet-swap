@@ -1,2 +1,2 @@
-// Changing this stack input publishes new facet code without restarting the Worker.
-export default "v1";
+// Optional manual salt. Changing it forces a new bundle hash.
+export default "";

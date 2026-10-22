@@ -11,7 +11,12 @@ export class App extends DurableObject<{ HASH: string; NOTES: Service<ScopedNote
     const served = this.ctx.storage.kv.get<number>("served") ?? 0;
 
     if (url.pathname === "/version") {
-      return Response.json({ v: VERSION, hash: this.env.HASH, served });
+      return Response.json({
+        v: this.env.HASH.slice(0, 12),
+        label: VERSION || undefined,
+        hash: this.env.HASH,
+        served,
+      });
     }
     if (url.pathname === "/notes") {
       const key = url.searchParams.get("key") ?? "note";
@@ -67,10 +72,11 @@ export class App extends DurableObject<{ HASH: string; NOTES: Service<ScopedNote
 
         seq++;
         const event = {
-          v: VERSION,
+          v: this.env.HASH.slice(0, 12),
+          label: VERSION || undefined,
           hash: this.env.HASH,
           seq,
-          msg: "hello from " + VERSION,
+          msg: "hello from " + this.env.HASH.slice(0, 12),
           served,
         };
         controller.enqueue(

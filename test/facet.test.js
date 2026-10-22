@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import * as Test from "alchemy/Test/Vitest";
@@ -108,12 +109,45 @@ test.provider(
       yield* Effect.tryPromise(async () => {
         const a = "alice_" + process.pid;
         const b = "bob_" + process.pid;
+        const unlabelled = await deploy();
+        const initial = await get("/u/unlabelled_" + process.pid + "/version");
+        assert.equal(initial.hash, unlabelled);
+        assert.equal(initial.v, unlabelled.slice(0, 12));
+        assert.equal(Object.hasOwn(initial, "label"), false);
+        pass("no manual label needed; clients see a short content hash");
+
         const v1 = await deploy("v1");
+        assert.notEqual(v1, unlabelled);
         const before = await get("/__local/publication");
         const repeated = await deploy("v1");
         assert.equal(repeated, v1);
         assert.deepEqual(await get("/__local/publication"), before);
         pass("unchanged stack redeploy skips R2 upload and KV latest write");
+        // Only app source changes; the optional label stays fixed.
+        const sourceUser = "source_" + process.pid;
+        assert.equal((await get("/u/" + sourceUser + "/version")).hash, v1);
+        const appPath = new URL("../src/app.ts", import.meta.url);
+        const originalSource = await readFile(appPath, "utf8");
+        try {
+          await writeFile(appPath, originalSource.replace('"hello from "', '"source edit from "'));
+          const sourceHash = await deploy("v1");
+          assert.notEqual(sourceHash, v1);
+          const publication = await get("/__local/publication");
+          assert.equal(publication.hash, sourceHash);
+          assert.notEqual(publication.metadata.publication, before.metadata.publication);
+          const sourceEvent = (await stream(sourceUser, 1, 0).done)[0];
+          assert.equal(sourceEvent.hash, sourceHash);
+          assert.equal(sourceEvent.v, sourceHash.slice(0, 12));
+          assert.equal(sourceEvent.label, "v1");
+          assert.equal(sourceEvent.msg, "source edit from " + sourceHash.slice(0, 12));
+          assert.equal(await deploy("v1"), sourceHash);
+          assert.deepEqual(await get("/__local/publication"), publication);
+          pass("source-only edit publishes and swaps with unchanged label; repeat is a no-op");
+        } finally {
+          await writeFile(appPath, originalSource);
+        }
+        assert.equal(await deploy("v1"), v1);
+
         assert.equal(
           (await fetch(base + "/__local/code", { method: "PUT", body: "bad" })).status,
           404,
@@ -125,7 +159,7 @@ test.provider(
         pass("old code-execution publication endpoints are removed");
         assert.equal((await get("/u/" + b + "/version")).hash, v1);
         const old = stream(a, 25, 100);
-        assert.equal((await old.started).v, "v1");
+        assert.equal((await old.started).label, "v1");
         const v2 = await deploy("v2");
         assert.notEqual(v2, v1);
         const updated = await get("/__local/publication");
@@ -146,7 +180,7 @@ test.provider(
         assert.equal(bob.served, 0);
         pass("another user's supervisor updates independently during Alice's drain");
         const oldEvents = await old.done;
-        assert(oldEvents.every((event) => event.v === "v1" && event.hash === v1));
+        assert(oldEvents.every((event) => event.label === "v1" && event.hash === v1));
         pass("all 25 SSE events finish on v1, without truncation or mixed versions");
         await until(async () => (await get("/u/" + a + "/__status")).pending === null);
         const after = await get("/u/" + a + "/version");
@@ -156,7 +190,9 @@ test.provider(
         const fresh = stream(a, 3, 10);
         const freshEvents = await fresh.done;
         assert(
-          freshEvents.every((event) => event.v === "v2" && event.hash === v2 && event.served === 2),
+          freshEvents.every(
+            (event) => event.label === "v2" && event.hash === v2 && event.served === 2,
+          ),
         );
         pass("fresh SSE stream is entirely v2, counter increments to 2");
 

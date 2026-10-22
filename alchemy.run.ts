@@ -8,6 +8,7 @@ import type { Notes } from "./src/gateway";
 import type { Supervisor } from "./src/supervisor";
 import { bundleFacet, publishFacet } from "./infra/facet";
 import version from "./facet-version";
+import "./infra/reconcile";
 
 export const gatewayWorker = (gatewayRevision = "g1") =>
   Effect.gen(function* () {
@@ -20,12 +21,12 @@ export const gatewayWorker = (gatewayRevision = "g1") =>
     });
   });
 
-export const resources = (version: string, gatewayRevision = "g1") =>
+export const resources = (label = version, gatewayRevision = "g1") =>
   Effect.gen(function* () {
     if (!(yield* AlchemyContext).dev) throw new Error("Local-only. Use npm run dev.");
     const code = yield* Cloudflare.R2.Bucket("Code");
     const versions = yield* Cloudflare.KV.Namespace("Versions");
-    const bundle = yield* bundleFacet(version);
+    const bundle = yield* bundleFacet(label);
     const published = yield* publishFacet(code, versions, bundle);
     const gateway = yield* gatewayWorker(gatewayRevision);
     const api = yield* Cloudflare.Worker("Api", {
