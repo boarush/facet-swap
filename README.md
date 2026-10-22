@@ -92,7 +92,7 @@ flowchart TD
 
 The normal workflow is to edit `src/app.ts` or its runtime dependencies, then run `npm run deploy` while Alchemy dev is running. With no argument, the CLI leaves `facet-version.ts` untouched, including its comments. It only changes a comment in the stack-imported `infra/reconcile.ts` to request another evaluation. That trigger is not bundled into the facet and is not an Action input, so reconciling unchanged code is a publication no-op. Alchemy watches the stack import graph, not the facet's separately bundled source; this command supplies the missing evaluation trigger. Starting dev also evaluates the current source without needing a label.
 
-`facet-version.ts` defaults to an empty string. It is an optional manual salt, not a release counter. `npm run deploy -- my-label` sets it and reconciles; `npm run deploy -- ''` clears it. Reusing the same label does not force publication. Change the label only when you want to change the hash without editing application code. The CLI does not bundle or upload anything itself.
+`facet-version.ts` defaults to "v1". It is an optional manual salt, not a release counter. `npm run deploy -- my-label` sets it and reconciles; `npm run deploy -- ''` clears it. Reusing the same label does not force publication. Change the label only when you want to change the hash without editing application code. The CLI does not bundle or upload anything itself.
 
 Keep the dev process running and wait for Alchemy's **Done** message before querying the new version. Changing the application source or optional salt does not change the Supervisor Worker's bundle, so its local provider remains unchanged and existing streams survive the stack reconciliation.
 
