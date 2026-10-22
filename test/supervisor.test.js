@@ -172,3 +172,40 @@ test("pending swap and due alarm both survive reconstruction without a fresh dra
   await restarted.alarm();
   assert.equal(restarted.getAlarm(), null);
 });
+
+test("Hono control routes retain update-check ordering and do not reach the facet", async () => {
+  const h = harness();
+  h.env.latest = "v2";
+  assert.equal((await h.status()).current.hash, "v1");
+  assert.equal(h.ctx.facets.abort.mock.calls.length, 0);
+  const methodError = await h.supervisor.fetch(new Request("http://local/__scope"));
+  assert.equal(methodError.status, 405);
+  assert.equal(await methodError.text(), "Method not allowed");
+  assert.equal((await h.status()).current.hash, "v2");
+  const invalid = await h.supervisor.fetch(
+    new Request("http://local/__scope", { method: "PUT", body: '{"readOnly":"yes"}' }),
+  );
+  assert.equal(invalid.status, 400);
+  await assert.rejects(
+    h.supervisor.fetch(
+      new Request("http://local/__scope", { method: "PUT", body: "invalid json" }),
+    ),
+    SyntaxError,
+  );
+  assert.equal(h.ctx.facets.get.mock.calls.length, 0);
+});
+
+test("HEAD cancels the Supervisor response wrapper instead of leaking inflight", async () => {
+  const h = harness();
+  const cancelled = vi.fn();
+  h.facet.fetch = async () =>
+    new Response(new ReadableStream({ cancel: cancelled }), {
+      headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+    });
+  const response = await h.supervisor.fetch(new Request("http://local/stream", { method: "HEAD" }));
+  assert.equal(response.status, 200);
+  assert.equal(response.body, null);
+  assert.equal(response.headers.get("cache-control"), "no-cache");
+  assert.equal(cancelled.mock.calls.length, 1);
+  assert.equal((await h.status()).inflight, 0);
+});
