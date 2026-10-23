@@ -1,8 +1,5 @@
 import * as Alchemy from "alchemy";
-import { AlchemyContext } from "alchemy/AlchemyContext";
 import * as Cloudflare from "alchemy/Cloudflare";
-import type { InferEnv } from "alchemy/Cloudflare";
-import { localState } from "alchemy/State";
 import * as Effect from "effect/Effect";
 
 import { bundleFacet, publishFacet } from "./infra/facet";
@@ -25,12 +22,15 @@ export const gatewayWorker = (gatewayRevision = "g1") =>
 
 export const resources = (label = version, gatewayRevision = "g1") =>
   Effect.gen(function* () {
-    if (!(yield* AlchemyContext).dev) throw new Error("Local-only. Use npm run dev.");
+    if (!(yield* Alchemy.AlchemyContext).dev) throw new Error("Local-only. Use npm run dev.");
+
     const code = yield* Cloudflare.R2.Bucket("Code");
     const versions = yield* Cloudflare.KV.Namespace("Versions");
+
     const bundle = yield* bundleFacet(label);
     const published = yield* publishFacet(code, versions, bundle);
     const gateway = yield* gatewayWorker(gatewayRevision);
+
     const api = yield* Cloudflare.Worker("Api", {
       main: "./src/worker.ts",
       compatibility: { date: "2026-10-21", flags: ["no_nodejs_compat", "enable_ctx_exports"] },
@@ -45,20 +45,21 @@ export const resources = (label = version, gatewayRevision = "g1") =>
       },
       dev: { host: "127.0.0.1", port: Number(process.env.PORT ?? 18743), strictPort: true },
     });
+
     return { api, gateway, published };
   });
 
 export const worker = resources(version).pipe(Effect.map((result) => result.api));
 
 // Bindings typed straight from the stack, so src never hand-writes them.
-export type GatewayEnv = InferEnv<ReturnType<typeof gatewayWorker>>;
-export type Env = InferEnv<typeof worker>;
+export type GatewayEnv = Cloudflare.InferEnv<ReturnType<typeof gatewayWorker>>;
+export type Env = Cloudflare.InferEnv<typeof worker>;
 
 export default Alchemy.Stack(
   "FacetSwap",
   {
     providers: Cloudflare.providers(),
-    state: localState(),
+    state: Alchemy.localState(),
   },
   worker.pipe(Effect.map((worker) => ({ url: worker.url }))),
 );
