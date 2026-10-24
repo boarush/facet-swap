@@ -10,7 +10,7 @@
   "main": "index.js",
   "scripts": {
     "check": "tsc --noEmit",
-    "deploy": "node scripts/deploy.mjs",
+    "deploy": "node scripts/deploy.ts",
     "dev": "alchemy dev --no-input",
     "fmt": "oxfmt --write .",
     "fmt:check": "oxfmt --check .",

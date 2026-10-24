@@ -14,8 +14,8 @@ test("deploy reconciles without touching the salt unless a label is supplied", a
   try {
     await mkdir(join(root, "scripts"));
     await mkdir(join(root, "infra"));
-    const cli = join(root, "scripts/deploy.mjs");
-    await copyFile(new URL("../scripts/deploy.mjs", import.meta.url), cli);
+    const cli = join(root, "scripts/deploy.ts");
+    await copyFile(new URL("../scripts/deploy.ts", import.meta.url), cli);
     const salt = join(root, "facet-version.ts");
     const original = '// Preserve my optional label and comments.\nexport default "custom";\n';
     await writeFile(salt, original);
