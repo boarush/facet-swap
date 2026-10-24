@@ -37,6 +37,16 @@ type Status = {
   inflight: number;
   swapping: boolean;
 };
+type Swap = {
+  oldHash: string | null;
+  newHash: string;
+  kind: "code" | "scope";
+  pendingSince: number;
+  swappedAt: number;
+  forced: boolean;
+  abortedStreams: number;
+  restartCommit: boolean;
+};
 type Publication = {
   hash: string | null;
   metadata: { version: string; publication: string } | null;
@@ -227,6 +237,15 @@ test.provider(
         assert(oldEvents.every((event) => event.label === "v1" && event.hash === v1));
         pass("all 25 SSE events finish on v1, without truncation or mixed versions");
         await until(async () => (await get<Status>("/u/" + a + "/__status")).pending === null);
+        const history = await get<{ swaps: Swap[] }>("/u/" + a + "/swaps?limit=1");
+        assert.equal(history.swaps.length, 1);
+        assert.equal(history.swaps[0].oldHash, v1);
+        assert.equal(history.swaps[0].newHash, v2);
+        assert.equal(history.swaps[0].kind, "code");
+        assert.equal(history.swaps[0].forced, false);
+        assert.equal(history.swaps[0].abortedStreams, 0);
+        assert.equal(history.swaps[0].restartCommit, false);
+        assert(history.swaps[0].swappedAt >= history.swaps[0].pendingSince);
         const after = await get("/u/" + a + "/version");
         assert.equal(after.hash, v2);
         assert.equal(after.served, 1);
@@ -357,6 +376,14 @@ test.provider(
         assert(forced.events.every((event) => event.hash === v3));
         assert(Date.now() - pendingAt >= Number(process.env.DRAIN_DEADLINE_MS) - 100);
         assert(Date.now() - pendingAt < Number(process.env.DRAIN_DEADLINE_MS) + 2000);
+        const deadlineLog = (await get<{ swaps: Swap[] }>("/u/" + a + "/swaps?limit=1")).swaps[0];
+        assert.equal(deadlineLog.oldHash, v3);
+        assert.equal(deadlineLog.newHash, v4);
+        assert.equal(deadlineLog.kind, "code");
+        assert.equal(deadlineLog.forced, true);
+        assert.equal(deadlineLog.abortedStreams, 1);
+        assert.equal(deadlineLog.restartCommit, false);
+        assert(deadlineLog.swappedAt - deadlineLog.pendingSince >= 3000);
         const afterDeadline = await get("/u/" + a + "/version");
         assert.equal(afterDeadline.hash, v4);
         assert.equal((await get<Status>("/u/" + a + "/__status")).inflight, 0);
@@ -379,6 +406,12 @@ test.provider(
           newVersion: v4,
         });
         assert.equal((await note(a, "secret", "must not write")).status, 403);
+        const scopeLog = (await get<{ swaps: Swap[] }>("/u/" + a + "/swaps?limit=1")).swaps[0];
+        assert.equal(scopeLog.oldHash, v4);
+        assert.equal(scopeLog.newHash, v4);
+        assert.equal(scopeLog.kind, "scope");
+        assert.equal(scopeLog.forced, true);
+        assert.equal(scopeLog.abortedStreams, 1);
         assert.equal((await get<Status>("/u/" + a + "/__status")).inflight, 0);
         pass("same-version scope drain has the same hard deadline and enforces new permission");
         const alarmUser = "alarm_" + process.pid;

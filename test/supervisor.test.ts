@@ -413,6 +413,9 @@ test("swap diagnostics are read-only, bypass checks, and retain only the newest 
     const response = await h.supervisor.fetch(new Request("http://local/swaps?limit=" + limit));
     assert.equal(response.status, 400);
   }
+  const head = await h.supervisor.fetch(new Request("http://local/swaps", { method: "HEAD" }));
+  assert.equal(head.status, 200);
+  assert.equal(head.body, null);
   const response = await h.supervisor.fetch(new Request("http://local/swaps", { method: "POST" }));
   assert.equal(response.status, 405);
   assert.equal((await h.status()).current!.hash, "v106");
