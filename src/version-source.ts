@@ -34,7 +34,7 @@ export async function loadApp(env: Env, hash: string, scope: NotesScope) {
     const object = await env.CODE.get("code/" + hash + ".js");
     if (!object) throw new Error("Missing code " + hash);
     return {
-      compatibilityDate: "2026-10-21",
+      compatibilityDate: "2026-10-12",
       mainModule: "app.js",
       modules: { "app.js": await object.text() },
       env: {

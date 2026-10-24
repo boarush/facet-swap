@@ -3,7 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 
-import * as Cloudflare from "alchemy/Cloudflare";
+import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Test from "alchemy/Test/Vitest";
 import * as Effect from "effect/Effect";
 
@@ -104,7 +104,7 @@ test.provider(
       const context = yield* Effect.context();
       const deploy = async (version, gatewayRevision) => {
         const result = await Effect.runPromiseWith(context)(
-          // Alchemy beta.83 exposes a broad deployment error channel.
+          // Alchemy beta.84 exposes a broad deployment error channel.
           // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context
           stack.deploy(resources(version, gatewayRevision)),
         );

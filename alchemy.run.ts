@@ -1,5 +1,5 @@
+import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Alchemy from "alchemy";
-import * as Cloudflare from "alchemy/Cloudflare";
 import * as Effect from "effect/Effect";
 
 import { bundleFacet, publishFacet } from "./infra/facet";
@@ -14,7 +14,7 @@ export const gatewayWorker = (gatewayRevision = "g1") =>
     const notes = yield* Cloudflare.R2.Bucket("Notes");
     return yield* Cloudflare.Worker("Gateway", {
       main: "./src/gateway.ts",
-      compatibility: { date: "2026-10-21", flags: ["no_nodejs_compat"] },
+      compatibility: { date: "2026-10-12", flags: ["no_nodejs_compat"] },
       env: { NOTES: notes, REVISION: gatewayRevision },
       dev: { host: "127.0.0.1" },
     });
@@ -33,7 +33,7 @@ export const resources = (label = version, gatewayRevision = "g1") =>
 
     const api = yield* Cloudflare.Worker("Api", {
       main: "./src/worker.ts",
-      compatibility: { date: "2026-10-21", flags: ["no_nodejs_compat", "enable_ctx_exports"] },
+      compatibility: { date: "2026-10-12", flags: ["no_nodejs_compat", "enable_ctx_exports"] },
       env: {
         GATEWAY: Cloudflare.WorkerEntrypoint<Notes>(gateway, "Notes"),
         CODE: code,

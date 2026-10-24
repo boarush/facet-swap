@@ -1,6 +1,6 @@
+import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Alchemy from "alchemy";
 import * as Bundle from "alchemy/Bundle";
-import * as Cloudflare from "alchemy/Cloudflare";
 import * as Effect from "effect/Effect";
 
 export const bundleFacet = (version: string) =>
