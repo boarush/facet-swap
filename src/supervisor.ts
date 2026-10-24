@@ -9,7 +9,22 @@ import { loadApp, VersionSource } from "./version-source";
 type ScheduledAlarm = { time: number; token: string };
 
 type AppConfig = { hash: string; readOnly: boolean };
-type VersionState = { current: AppConfig | null; pending: AppConfig | null };
+type VersionState = {
+  current: AppConfig | null;
+  pending: AppConfig | null;
+  pendingSince?: number;
+};
+type SwapRow = {
+  id: number;
+  oldHash: string | null;
+  newHash: string;
+  kind: "code" | "scope";
+  pendingSince: number;
+  swappedAt: number;
+  forced: number;
+  abortedStreams: number;
+  restartCommit: number;
+};
 
 // This class stays stable; only the app facet's code is versioned.
 export class Supervisor extends DurableObject<Env> {
@@ -17,6 +32,7 @@ export class Supervisor extends DurableObject<Env> {
   private swapping = false;
   private runningAlarm?: string;
   private readonly active = new Set<AbortController>();
+  private readonly streams = new Set<AbortController>();
   private drainTimer?: ReturnType<typeof setTimeout>;
   private readonly versions: VersionSource;
 
@@ -24,8 +40,16 @@ export class Supervisor extends DurableObject<Env> {
     super(ctx, env);
     this.versions = new VersionSource(env);
     this.state = ctx.storage.kv.get<VersionState>("app-config") ?? { current: null, pending: null };
+    ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS swaps (
+        id INTEGER PRIMARY KEY,
+        oldHash TEXT, newHash TEXT NOT NULL, kind TEXT NOT NULL,
+        pendingSince INTEGER NOT NULL, swappedAt INTEGER NOT NULL,
+        forced INTEGER NOT NULL, abortedStreams INTEGER NOT NULL, restartCommit INTEGER NOT NULL
+      )
+    `);
     // Inflight tracking cannot survive restart; finish any persisted pending swap on wake.
-    this.swapWhenIdle();
+    this.swap(false, true);
   }
 
   private readonly router = createRouter<Env>()
@@ -37,6 +61,19 @@ export class Supervisor extends DurableObject<Env> {
         swapping: this.swapping,
       }),
     )
+    .get("/swaps", (c) => {
+      const raw = c.req.query("limit") ?? "20";
+      const limit = Number(raw);
+      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(limit) || limit < 1) {
+        return new Response("Invalid limit", { status: 400 });
+      }
+      const swaps = this.ctx.storage.sql
+        .exec<SwapRow>("SELECT * FROM swaps ORDER BY id DESC LIMIT ?", Math.min(limit, 100))
+        .toArray()
+        .map((row) => ({ ...row, forced: !!row.forced, restartCommit: !!row.restartCommit }));
+      return Response.json({ swaps });
+    })
+    .all("/swaps", () => new Response("Method not allowed", { status: 405 }))
     .use(async (_c, next) => {
       await this.checkForUpdate();
       await next();
@@ -140,6 +177,7 @@ export class Supervisor extends DurableObject<Env> {
   }
 
   private stage(config: AppConfig): void {
+    this.state.pendingSince ??= Date.now();
     this.state.pending = config;
     this.ctx.storage.kv.put("app-config", this.state);
     // Replacing pending code/scope never extends an already-running deadline.
@@ -154,7 +192,7 @@ export class Supervisor extends DurableObject<Env> {
     if (this.active.size === 0) this.swap();
   }
 
-  private swap(force = false): void {
+  private swap(force = false, restartCommit = false): void {
     if (this.swapping || !this.state.pending || (!force && this.active.size !== 0)) return;
     this.swapping = true;
     try {
@@ -165,9 +203,29 @@ export class Supervisor extends DurableObject<Env> {
         oldVersion: this.state.current?.hash ?? "",
         newVersion: this.state.pending.hash,
       };
-      this.state = { current: this.state.pending, pending: null };
-      // Persist before abort, without yielding: eviction must restart on current.
-      this.ctx.storage.kv.put("app-config", this.state);
+      const swappedAt = Date.now();
+      const next = { current: this.state.pending, pending: null };
+      // Commit history with current atomically; restart must not lose or duplicate a row.
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.kv.put("app-config", next);
+        this.ctx.storage.sql.exec(
+          `INSERT INTO swaps
+            (oldHash, newHash, kind, pendingSince, swappedAt, forced, abortedStreams, restartCommit)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          this.state.current?.hash ?? null,
+          next.current.hash,
+          this.state.current?.hash === next.current.hash ? "scope" : "code",
+          this.state.pendingSince ?? swappedAt,
+          swappedAt,
+          Number(force),
+          force ? this.streams.size : 0,
+          Number(restartCommit),
+        );
+        this.ctx.storage.sql.exec(
+          "DELETE FROM swaps WHERE id NOT IN (SELECT id FROM swaps ORDER BY id DESC LIMIT 100)",
+        );
+      });
+      this.state = next;
       // Finish Supervisor-owned SSE bodies before aborting their facet source.
       if (force) {
         for (const controller of this.active) controller.abort(reason);
@@ -194,6 +252,7 @@ export class Supervisor extends DurableObject<Env> {
     this.active.add(controller);
     const release = () => {
       // Old header/body completions after a forced swap cannot release new work.
+      this.streams.delete(controller);
       if (this.active.delete(controller)) this.swapWhenIdle();
     };
     return { controller, release };
@@ -203,6 +262,7 @@ export class Supervisor extends DurableObject<Env> {
     const { controller, release } = this.beginWork();
     try {
       const response = await this.app().fetch(request);
+      if (response.body && !controller.signal.aborted) this.streams.add(controller);
       return trackResponseBody(response, controller.signal, release);
     } catch (error) {
       release();
