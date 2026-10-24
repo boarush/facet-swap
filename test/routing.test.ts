@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 
 import { afterEach, test, vi } from "vitest";
 
+import type { Env } from "../alchemy.run";
+
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {
-    constructor(ctx, env) {
+    ctx: DurableObjectState;
+    env: unknown;
+    constructor(ctx: DurableObjectState, env: unknown) {
       this.ctx = ctx;
       this.env = env;
     }
@@ -20,12 +24,12 @@ const { createRouter } = await import("../src/router");
 afterEach(() => vi.unstubAllGlobals());
 
 function entry() {
-  const forwarded = [];
+  const forwarded: { user: string; request: Request }[] = [];
   const env = {
     SUPERVISORS: {
-      idFromName: (user) => user,
-      get: (user) => ({
-        fetch: async (request) => {
+      idFromName: (user: string) => user,
+      get: (user: string) => ({
+        fetch: async (request: Request) => {
           forwarded.push({ user, request });
           return new Response("forwarded", { headers: { "x-test": "untouched" } });
         },
@@ -34,31 +38,45 @@ function entry() {
   };
   return {
     forwarded,
-    fetch: (path, init) => worker.fetch(new Request("http://local" + path, init), env),
+    fetch: (path: string, init?: RequestInit) =>
+      worker.fetch(new Request("http://local" + path, init), env as unknown as Env),
   };
 }
 
 function facet() {
   vi.stubGlobal("VERSION", "v1");
-  const data = new Map();
+  const data = new Map<string, unknown>();
   const env = {
     HASH: "1234567890abcdef",
     NOTES: {
-      get: vi.fn(async (key) => key),
-      put: vi.fn(async () => {}),
+      get: vi.fn<(key: string) => Promise<string>>(async (key) => key),
+      put: vi.fn<(key: string, value: string) => Promise<void>>(async () => {}),
       revision: async () => "g1",
     },
     SCHEDULER: {
       getAlarm: async () => null,
-      setAlarm: vi.fn(async () => {}),
-      deleteAlarm: vi.fn(async () => {}),
+      setAlarm: vi.fn<(time: number | Date) => Promise<void>>(async () => {}),
+      deleteAlarm: vi.fn<() => Promise<void>>(async () => {}),
     },
   };
   const app = new App(
-    { storage: { kv: { get: (key) => data.get(key), put: (key, value) => data.set(key, value) } } },
-    env,
+    // The unit harness implements only the storage and RPC surface exercised here.
+    {
+      storage: {
+        kv: {
+          get: (key: string) => data.get(key),
+          put: (key: string, value: unknown) => data.set(key, value),
+        },
+      },
+    } as unknown as DurableObjectState,
+    env as unknown as ConstructorParameters<typeof App>[1],
   );
-  return { env, data, fetch: (path, init) => app.fetch(new Request("http://local" + path, init)) };
+  return {
+    env,
+    data,
+    fetch: (path: string, init?: RequestInit) =>
+      app.fetch(new Request("http://local" + path, init)),
+  };
 }
 
 test("entry routes keep exact paths, methods, raw user identity and forwarded requests", async () => {
@@ -83,6 +101,7 @@ test("entry routes keep exact paths, methods, raw user identity and forwarded re
     });
     assert.equal(response.headers.get("x-test"), "untouched");
     const forwarded = h.forwarded.at(-1);
+    assert(forwarded);
     assert.equal(forwarded.user, user);
     assert.equal(forwarded.request.url, "http://local" + suffix);
     assert.equal(forwarded.request.method, "PUT");
@@ -99,7 +118,7 @@ test("facet routes retain method errors, validation, query decoding and exact 40
     assert.equal(await response.text(), "Not found");
   }
   assert.equal(
-    (await (await h.fetch("/version", { method: "POST" })).json()).hash,
+    (await (await h.fetch("/version", { method: "POST" })).json<{ hash: string }>()).hash,
     "1234567890abcdef",
   );
   for (const path of ["/notes", "/alarm"]) {
@@ -109,9 +128,12 @@ test("facet routes retain method errors, validation, query decoding and exact 40
       if (method !== "HEAD") assert.equal(await response.text(), "Method not allowed");
     }
   }
-  assert.equal((await (await h.fetch("/notes?key=a+b&key=ignored")).json()).value, "a b");
-  assert.equal((await (await h.fetch("/notes?key=")).json()).value, "");
-  assert.equal((await (await h.fetch("/notes")).json()).value, "note");
+  assert.equal(
+    (await (await h.fetch("/notes?key=a+b&key=ignored")).json<{ value: string }>()).value,
+    "a b",
+  );
+  assert.equal((await (await h.fetch("/notes?key=")).json<{ value: string }>()).value, "");
+  assert.equal((await (await h.fetch("/notes")).json<{ value: string }>()).value, "note");
   assert.equal((await h.fetch("/alarm", { method: "PUT", body: '{"time":0}' })).status, 400);
   assert.equal((await h.fetch("/stream?n=0")).status, 400);
   assert.equal((await h.fetch("/stream?ms=Infinity")).status, 400);
@@ -123,7 +145,7 @@ test("facet routes retain method errors, validation, query decoding and exact 40
 
 test("routing propagates unexpected errors and cancels discarded HEAD bodies", async () => {
   const app = createRouter();
-  const cancelled = vi.fn();
+  const cancelled = vi.fn<(reason?: unknown) => void>();
   app.all(
     "/stream",
     () =>

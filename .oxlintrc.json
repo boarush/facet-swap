@@ -51,7 +51,7 @@
       }
     },
     {
-      "files": ["test/**/*.js", "test/**/*.ts"],
+      "files": ["test/**/*.ts"],
       "plugins": ["vitest"],
       "rules": {
         "vitest/no-focused-tests": "error",

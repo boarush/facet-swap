@@ -7,7 +7,7 @@ import { trackResponseBody } from "../src/stream-lifetime";
 const reason = { reason: "drain-deadline", oldVersion: "old", newVersion: "new" };
 
 test("deadline closes SSE even with an upstream read pending, cancelling its source once", async () => {
-  let cancelled;
+  let cancelled: unknown;
   let released = 0;
   const aborter = new AbortController();
   const source = new ReadableStream({
@@ -41,7 +41,7 @@ test("completed body releases once and cannot receive a later abort frame", asyn
 });
 
 test("non-SSE bodies fail rather than receiving an invalid SSE suffix", async () => {
-  let cancelled;
+  let cancelled: unknown;
   let released = 0;
   const aborter = new AbortController();
   const response = trackResponseBody(
@@ -55,6 +55,7 @@ test("non-SSE bodies fail rather than receiving an invalid SSE suffix", async ()
     aborter.signal,
     () => released++,
   );
+  assert(response.body);
   const reader = response.body.getReader();
   const reading = reader.read();
   aborter.abort(reason);
@@ -64,7 +65,7 @@ test("non-SSE bodies fail rather than receiving an invalid SSE suffix", async ()
 });
 
 test("client cancellation releases once and forwards cancellation upstream", async () => {
-  let cancelled;
+  let cancelled: unknown;
   let released = 0;
   const aborter = new AbortController();
   const response = trackResponseBody(
@@ -78,6 +79,7 @@ test("client cancellation releases once and forwards cancellation upstream", asy
     aborter.signal,
     () => released++,
   );
+  assert(response.body);
   await response.body.cancel("client left");
   aborter.abort(reason);
   assert.equal(cancelled, "client left");

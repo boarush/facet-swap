@@ -197,13 +197,13 @@ There is no rollback or canary path. A faulty release is corrected by publishing
 
 `src/` holds runtime code: entry Worker, Supervisor, shared Hono router, version lookup and loading, response lifetime tracking, and the SSE application.
 
-`infra/` holds the facet bundle and publication Effects used by the stack. `scripts/` contains only the deploy CLI. `test/` contains the Vitest integration test. `facet-version.ts` is the optional manual salt; `infra/reconcile.ts` is the CLI's stack-only evaluation trigger.
+`infra/` holds the facet bundle and publication Effects used by the stack. `scripts/` contains only the deploy CLI. `test/` contains typed Vitest integration and regression tests. `facet-version.ts` is the optional manual salt; `infra/reconcile.ts` is the CLI's stack-only evaluation trigger.
 
 Binding types come from `Env = InferEnv<typeof worker>` and `GatewayEnv = InferEnv<ReturnType<typeof gatewayWorker>>` in `alchemy.run.ts`. Runtime modules import that type only, so stack code stays out of the Worker bundle.
 
 Oxlint runs type-aware correctness rules, the Effect recommended preset, Promise checks, type-only import checks, and focused/disabled-test checks. Warnings fail the lint command. Runtime cannot import infrastructure, scripts, or tests, and its imports from `alchemy.run` must be type-only. Runtime and infrastructure cannot import CLI entrypoints or tests. Oxfmt handles formatting and import order separately. Imports are grouped as Node builtins, external packages, project-boundary imports (the stack, infra, and src), then relative modules, with blank lines between groups. Type imports stay alongside values from the same group; Oxlint still enforces type-only usage. Side-effect imports keep their evaluation order. Package keys and scripts are sorted too.
 
-The installed compiler is TypeScript 7.0.2. `npm run check` invokes its native compiler through `tsc --noEmit`. Effect's `@effect/tsgo` integration patches TypeScript, Oxlint, and its `oxlint-tsgolint` backend during the prepare hook. Those three packages are pinned to versions supported by the installed integration; upgrade them together against its compatibility table. Effect diagnostics run through Oxlint, not twice through both lint and typecheck (`diagnostics: false` in the plugin options). JavaScript scripts and tests are included in the TypeScript program for type-aware linting, without enabling `checkJs`. The configuration retains the `@effect/language-service` plugin key, but the old JavaScript plugin package is not installed. Editors should use the Effect native language server.
+The installed compiler is TypeScript 7.0.2. `npm run check` invokes its native compiler through `tsc --noEmit`. Effect's `@effect/tsgo` integration patches TypeScript, Oxlint, and its `oxlint-tsgolint` backend during the prepare hook. Those three packages are pinned to versions supported by the installed integration; upgrade them together against its compatibility table. Effect diagnostics run through Oxlint, not twice through both lint and typecheck (`diagnostics: false` in the plugin options). Scripts and tests are TypeScript, included in the strict typecheck and type-aware linting; `allowJs` is disabled. Type-only imports are explicit through `verbatimModuleSyntax`. The configuration retains the `@effect/language-service` plugin key, but the old JavaScript plugin package is not installed. Editors should use the Effect native language server.
 
 Alchemy and its separate `@alchemy.run/cloudflare` provider are pinned to beta.84. Cloudflare imports and inferred binding types come from the provider package; bundling, Actions, local state, and the Vitest adapter remain in core Alchemy. The provider runtime pins workerd 1.20261012.1, which passes the facet integration suite without a direct workerd dependency or npm override. Both stack Workers and dynamically loaded facets use compatibility date 2026-10-12, within that binary's supported range. No custom workerd launcher or plain Wrangler fallback is used.
 
@@ -217,7 +217,7 @@ The old writable publication endpoints return 404. Read-only publication and Sup
 
 ## Running the Demo
 
-Use Node 24.11.1+ (or 25.1+) and npm. The dev command runs the project-local Alchemy CLI under Node, using its Oxc loader for the TypeScript stack. Install dependencies and run the checks.
+Use Node 24.11.1+ (or 25.1+) and npm. The dev command runs the project-local Alchemy CLI under Node, using its Oxc loader for the TypeScript stack. The deploy CLI runs directly as `node scripts/deploy.ts`, using Node's native type stripping and only erasable TypeScript syntax. Install dependencies and run the checks.
 
 ```sh
 npm ci

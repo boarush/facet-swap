@@ -14,7 +14,8 @@
         "diagnostics": false
       }
     ],
-    "allowJs": true
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true
   },
   "include": [
     "src/**/*.ts",
@@ -22,7 +23,7 @@
     "alchemy.run.ts",
     "facet-version.ts",
     "vitest.config.ts",
-    "scripts/**/*.mjs",
-    "test/**/*.js"
+    "scripts/**/*.ts",
+    "test/**/*.ts"
   ]
 }

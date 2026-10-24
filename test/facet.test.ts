@@ -8,11 +8,14 @@ import * as Test from "alchemy/Test/Vitest";
 import * as Effect from "effect/Effect";
 
 import { resources } from "../alchemy.run.ts";
+import type { UpdateAbort } from "../src/stream-lifetime";
 
-const port = await new Promise((resolve) => {
+const port = await new Promise<number>((resolve) => {
   const server = createServer();
   server.listen(0, "127.0.0.1", () => {
-    const port = server.address().port;
+    const address = server.address();
+    assert(address && typeof address !== "string");
+    const port = address.port;
     server.close(() => resolve(port));
   });
 });
@@ -25,12 +28,32 @@ const { test } = Test.make({
   dev: true,
   stage: "test_" + process.pid,
 });
-async function get(path) {
+type Version = { v: string; hash: string; label?: string; served: number };
+type StreamEvent = Version & { seq: number; msg: string };
+type Config = { hash: string; readOnly: boolean };
+type Status = {
+  current: Config | null;
+  pending: Config | null;
+  inflight: number;
+  swapping: boolean;
+};
+type Publication = {
+  hash: string | null;
+  metadata: { version: string; publication: string } | null;
+  uploaded?: string;
+};
+type Alarm = {
+  scheduled: number | null;
+  count: number;
+  last: { hash: string; scheduled: number | null } | null;
+};
+
+async function get<T = Version>(path: string): Promise<T> {
   const response = await fetch(base + path);
   assert.equal(response.status, 200, await response.clone().text());
-  return response.json();
+  return response.json<T>();
 }
-async function until(fn) {
+async function until(fn: () => Promise<boolean>) {
   const end = Date.now() + 10000;
   while (Date.now() < end) {
     if (await fn()) return;
@@ -38,18 +61,25 @@ async function until(fn) {
   }
   throw new Error("Condition timed out");
 }
-function stream(user, n, ms, expectAbort = false) {
-  let first;
-  const started = new Promise((resolve) => {
+type StreamRun<T> = { started: Promise<StreamEvent>; done: Promise<T> };
+type AbortedStream = { events: StreamEvent[]; updateAbort: UpdateAbort };
+function stream(user: string, n: number, ms: number, expectAbort: true): StreamRun<AbortedStream>;
+function stream(user: string, n: number, ms: number, expectAbort?: false): StreamRun<StreamEvent[]>;
+function stream(user: string, n: number, ms: number, expectAbort = false) {
+  let first!: (event: StreamEvent) => void;
+  let rejectStarted!: (reason: unknown) => void;
+  const started = new Promise<StreamEvent>((resolve, reject) => {
     first = resolve;
+    rejectStarted = reject;
   });
   const done = (async () => {
     const response = await fetch(base + "/u/" + user + "/stream?n=" + n + "&ms=" + ms);
     assert.equal(response.status, 200);
-    const events = [];
-    let updateAbort;
+    const events: StreamEvent[] = [];
+    let updateAbort: UpdateAbort | undefined;
     let buffered = "";
     const decoder = new TextDecoder();
+    assert(response.body);
     for await (const chunk of response.body) {
       buffered += decoder.decode(chunk, { stream: true });
       let index;
@@ -58,12 +88,13 @@ function stream(user, n, ms, expectAbort = false) {
         buffered = buffered.slice(index + 2);
         const data = frame.split("\n").find((line) => line.startsWith("data: "));
         if (data) {
-          const event = JSON.parse(data.slice(6));
+          const parsed: unknown = JSON.parse(data.slice(6));
           if (frame.includes("event: update-abort")) {
             assert.equal(updateAbort, undefined);
-            updateAbort = event;
+            updateAbort = parsed as UpdateAbort;
             continue;
           }
+          const event = parsed as StreamEvent;
           assert.equal(updateAbort, undefined, "no source events after update-abort");
           assert.equal(frame.split("\n")[0], "id: " + event.seq);
           events.push(event);
@@ -82,13 +113,22 @@ function stream(user, n, ms, expectAbort = false) {
       events.map((e) => e.seq),
       Array.from({ length: events.length }, (_, i) => i + 1),
     );
-    return expectAbort ? { events, updateAbort } : events;
+    if (expectAbort) {
+      assert(updateAbort);
+      return { events, updateAbort };
+    }
+    return events;
   })();
   // Surface startup errors to both consumers.
-  done.catch((error) => first(Promise.reject(error)));
+  void done.catch(rejectStarted);
   return { started, done };
 }
-async function rejectedDuringDrain(path, current, pending, init) {
+async function rejectedDuringDrain(
+  path: string,
+  current: string,
+  pending: string,
+  init?: RequestInit,
+) {
   const response = await fetch(base + path, init);
   assert.equal(response.status, 503, await response.text());
   assert.equal(response.headers.get("Retry-After"), "1");
@@ -96,13 +136,13 @@ async function rejectedDuringDrain(path, current, pending, init) {
   assert.equal(response.headers.get("X-Pending-Version"), pending);
   assert.equal(response.headers.get("Cache-Control"), "no-store");
 }
-const pass = (message) => console.log("PASS " + message);
+const pass = (message: string) => console.log("PASS " + message);
 test.provider(
   "facet swap",
   (stack) =>
     Effect.gen(function* () {
       const context = yield* Effect.context();
-      const deploy = async (version, gatewayRevision) => {
+      const deploy = async (version: string, gatewayRevision?: string) => {
         const result = await Effect.runPromiseWith(context)(
           // Alchemy beta.84 exposes a broad deployment error channel.
           // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context
@@ -122,10 +162,10 @@ test.provider(
 
         const v1 = await deploy("v1");
         assert.notEqual(v1, unlabelled);
-        const before = await get("/__local/publication");
+        const before = await get<Publication>("/__local/publication");
         const repeated = await deploy("v1");
         assert.equal(repeated, v1);
-        assert.deepEqual(await get("/__local/publication"), before);
+        assert.deepEqual(await get<Publication>("/__local/publication"), before);
         pass("unchanged stack redeploy skips R2 upload and KV latest write");
         // Only app source changes; the optional label stays fixed.
         const sourceUser = "source_" + process.pid;
@@ -136,16 +176,16 @@ test.provider(
           await writeFile(appPath, originalSource.replace('"hello from "', '"source edit from "'));
           const sourceHash = await deploy("v1");
           assert.notEqual(sourceHash, v1);
-          const publication = await get("/__local/publication");
+          const publication = await get<Publication>("/__local/publication");
           assert.equal(publication.hash, sourceHash);
-          assert.notEqual(publication.metadata.publication, before.metadata.publication);
+          assert.notEqual(publication.metadata!.publication, before.metadata!.publication);
           const sourceEvent = (await stream(sourceUser, 1, 0).done)[0];
           assert.equal(sourceEvent.hash, sourceHash);
           assert.equal(sourceEvent.v, sourceHash.slice(0, 12));
           assert.equal(sourceEvent.label, "v1");
           assert.equal(sourceEvent.msg, "source edit from " + sourceHash.slice(0, 12));
           assert.equal(await deploy("v1"), sourceHash);
-          assert.deepEqual(await get("/__local/publication"), publication);
+          assert.deepEqual(await get<Publication>("/__local/publication"), publication);
           pass("source-only edit publishes and swaps with unchanged label; repeat is a no-op");
         } finally {
           await writeFile(appPath, originalSource);
@@ -166,15 +206,15 @@ test.provider(
         assert.equal((await old.started).label, "v1");
         const v2 = await deploy("v2");
         assert.notEqual(v2, v1);
-        const updated = await get("/__local/publication");
+        const updated = await get<Publication>("/__local/publication");
         assert.equal(updated.hash, v2);
-        assert.equal(updated.metadata.version, "v2");
-        assert.notEqual(updated.metadata.publication, before.metadata.publication);
+        assert.equal(updated.metadata!.version, "v2");
+        assert.notEqual(updated.metadata!.publication, before.metadata!.publication);
         assert.notEqual(updated.uploaded, before.uploaded);
         await rejectedDuringDrain("/u/" + a + "/version", v1, v2);
-        const draining = await get("/u/" + a + "/__status");
-        assert.equal(draining.pending.hash, v2);
-        assert.equal(draining.current.hash, v1);
+        const draining = await get<Status>("/u/" + a + "/__status");
+        assert.equal(draining.pending!.hash, v2);
+        assert.equal(draining.current!.hash, v1);
         assert.equal(draining.inflight, 1);
         pass(
           "request during drain gets 503 with retry/version headers, active stream still counted",
@@ -186,7 +226,7 @@ test.provider(
         const oldEvents = await old.done;
         assert(oldEvents.every((event) => event.label === "v1" && event.hash === v1));
         pass("all 25 SSE events finish on v1, without truncation or mixed versions");
-        await until(async () => (await get("/u/" + a + "/__status")).pending === null);
+        await until(async () => (await get<Status>("/u/" + a + "/__status")).pending === null);
         const after = await get("/u/" + a + "/version");
         assert.equal(after.hash, v2);
         assert.equal(after.served, 1);
@@ -205,32 +245,33 @@ test.provider(
         const response = await fetch(base + "/u/" + a + "/stream?n=100&ms=100", {
           signal: aborter.signal,
         });
+        assert(response.body);
         const reader = response.body.getReader();
         await reader.read();
         const v3 = await deploy("v3");
         await rejectedDuringDrain("/u/" + a + "/version", v2, v3);
-        assert.equal((await get("/u/" + a + "/__status")).inflight, 1);
+        assert.equal((await get<Status>("/u/" + a + "/__status")).inflight, 1);
         aborter.abort();
         try {
           await reader.cancel();
         } catch {}
         await until(async () => {
-          const status = await get("/u/" + a + "/__status");
-          return status.pending === null && status.inflight === 0 && status.current.hash === v3;
+          const status = await get<Status>("/u/" + a + "/__status");
+          return status.pending === null && status.inflight === 0 && status.current!.hash === v3;
         });
         const afterCancel = await get("/u/" + a + "/version");
         assert.equal(afterCancel.hash, v3);
         assert.equal(afterCancel.served, 3);
         pass("client cancellation releases inflight, allows pending v3 swap, preserves SQLite");
         // These calls run inside F and cross two real service-binding boundaries.
-        const note = async (user, key, value) => {
+        const note = async (user: string, key: string, value?: string) => {
           const response = await fetch(
             base + "/u/" + user + "/notes?key=" + encodeURIComponent(key),
             value === undefined ? {} : { method: "PUT", body: value },
           );
           return response;
         };
-        const scope = async (user, readOnly) => {
+        const scope = async (user: string, readOnly: boolean) => {
           const response = await fetch(base + "/u/" + user + "/__scope", {
             method: "PUT",
             body: JSON.stringify({ readOnly }),
@@ -241,10 +282,19 @@ test.provider(
           value: "alice only",
           gateway: "g1",
         });
-        assert.equal((await (await note(b, "secret")).json()).value, null);
+        assert.equal(
+          (await (await note(b, "secret")).json<{ value: string | null }>()).value,
+          null,
+        );
         await note(b, "secret", "bob only");
-        assert.equal((await (await note(a, "secret")).json()).value, "alice only");
-        assert.equal((await (await note(b, "secret")).json()).value, "bob only");
+        assert.equal(
+          (await (await note(a, "secret")).json<{ value: string | null }>()).value,
+          "alice only",
+        );
+        assert.equal(
+          (await (await note(b, "secret")).json<{ value: string | null }>()).value,
+          "bob only",
+        );
         for (const key of ["../" + b + "/secret", b + "/secret", "/secret", ""]) {
           assert.equal((await note(a, key)).status, 403);
           assert.equal((await note(a, key, "overwrite")).status, 403);
@@ -268,22 +318,25 @@ test.provider(
         const drainingScope = stream(a, 12, 100);
         await drainingScope.started;
         await scope(a, true);
-        const status = await get("/u/" + a + "/__status");
-        assert.equal(status.current.hash, v3);
-        assert.equal(status.pending.hash, v3);
-        assert.equal(status.current.readOnly, false);
-        assert.equal(status.pending.readOnly, true);
+        const status = await get<Status>("/u/" + a + "/__status");
+        assert.equal(status.current!.hash, v3);
+        assert.equal(status.pending!.hash, v3);
+        assert.equal(status.current!.readOnly, false);
+        assert.equal(status.pending!.readOnly, true);
         assert.equal(status.inflight, 1);
         await rejectedDuringDrain("/u/" + a + "/notes?key=secret", v3, v3, {
           method: "PUT",
           body: "must not write",
         });
         assert.equal((await note(b, "secret", "bob still writes")).status, 200);
-        assert.equal((await get("/u/" + a + "/__status")).inflight, 1);
+        assert.equal((await get<Status>("/u/" + a + "/__status")).inflight, 1);
         assert.equal((await drainingScope.done).length, 12);
-        await until(async () => (await get("/u/" + a + "/__status")).pending === null);
+        await until(async () => (await get<Status>("/u/" + a + "/__status")).pending === null);
         assert.equal((await note(a, "secret", "must not write")).status, 403);
-        assert.equal((await (await note(a, "secret")).json()).value, "alice only");
+        assert.equal(
+          (await (await note(a, "secret")).json<{ value: string | null }>()).value,
+          "alice only",
+        );
         assert.equal((await get("/u/" + a + "/version")).hash, v3);
         await scope(b, false);
         assert.equal((await note(b, "secret", "bob still writes")).status, 200);
@@ -306,7 +359,7 @@ test.provider(
         assert(Date.now() - pendingAt < Number(process.env.DRAIN_DEADLINE_MS) + 2000);
         const afterDeadline = await get("/u/" + a + "/version");
         assert.equal(afterDeadline.hash, v4);
-        assert.equal((await get("/u/" + a + "/__status")).inflight, 0);
+        assert.equal((await get<Status>("/u/" + a + "/__status")).inflight, 0);
         const nextStream = await stream(a, 3, 10).done;
         assert(nextStream.every((event) => event.hash === v4));
         assert.equal(nextStream[0].served, afterDeadline.served + 1);
@@ -326,29 +379,29 @@ test.provider(
           newVersion: v4,
         });
         assert.equal((await note(a, "secret", "must not write")).status, 403);
-        assert.equal((await get("/u/" + a + "/__status")).inflight, 0);
+        assert.equal((await get<Status>("/u/" + a + "/__status")).inflight, 0);
         pass("same-version scope drain has the same hard deadline and enforces new permission");
         const alarmUser = "alarm_" + process.pid;
         const alarmPath = "/u/" + alarmUser + "/alarm";
-        const schedule = async (time) => {
+        const schedule = async (time: number) => {
           const response = await fetch(base + alarmPath, {
             method: "PUT",
             body: JSON.stringify({ time }),
           });
           assert.equal(response.status, 200, await response.clone().text());
-          assert.equal((await response.json()).scheduled, time);
+          assert.equal((await response.json<{ scheduled: number | null }>()).scheduled, time);
         };
-        assert.deepEqual(await get(alarmPath), { scheduled: null, count: 0, last: null });
+        assert.deepEqual(await get<Alarm>(alarmPath), { scheduled: null, count: 0, last: null });
         const cancelledAt = Date.now() + 300;
         await schedule(cancelledAt);
         const deleted = await fetch(base + alarmPath, { method: "DELETE" });
         assert.equal(deleted.status, 200);
-        assert.equal((await deleted.json()).scheduled, null);
+        assert.equal((await deleted.json<{ scheduled: number | null }>()).scheduled, null);
         await delay(400);
-        assert.equal((await get(alarmPath)).count, 0);
+        assert.equal((await get<Alarm>(alarmPath)).count, 0);
         await schedule(Date.now() + 200);
-        await until(async () => (await get(alarmPath)).count === 1);
-        assert.deepEqual(await get(alarmPath), {
+        await until(async () => (await get<Alarm>(alarmPath)).count === 1);
+        assert.deepEqual(await get<Alarm>(alarmPath), {
           scheduled: null,
           count: 1,
           last: { hash: v4, scheduled: null },
@@ -360,7 +413,7 @@ test.provider(
         await schedule(Date.now() + 2000);
         const v5 = await deploy("v5", "g2");
         await delay(2200);
-        const swappedAlarm = await get(alarmPath);
+        const swappedAlarm = await get<Alarm>(alarmPath);
         assert.equal(swappedAlarm.count, 2);
         assert.deepEqual(swappedAlarm.last, { hash: v5, scheduled: null });
         assert.equal(swappedAlarm.scheduled, null);
@@ -372,10 +425,10 @@ test.provider(
         const v6 = await deploy("v6", "g2");
         await rejectedDuringDrain("/u/" + alarmUser + "/version", v5, v6);
         await delay(1200);
-        assert.equal((await get("/u/" + alarmUser + "/__status")).pending.hash, v6);
+        assert.equal((await get<Status>("/u/" + alarmUser + "/__status")).pending!.hash, v6);
         await alarmDrain.done;
-        await until(async () => (await get(alarmPath)).count === 3);
-        assert.deepEqual((await get(alarmPath)).last, { hash: v6, scheduled: null });
+        await until(async () => (await get<Alarm>(alarmPath)).count === 3);
+        assert.deepEqual((await get<Alarm>(alarmPath)).last, { hash: v6, scheduled: null });
         pass("alarm due during a normal drain defers and runs only after swap on new code");
 
         await schedule(Date.now() + 1000);
@@ -385,8 +438,8 @@ test.provider(
         await rejectedDuringDrain("/u/" + alarmUser + "/version", v6, v7);
         const forcedAlarm = await forcedAlarmDrain.done;
         assert.equal(forcedAlarm.updateAbort.newVersion, v7);
-        await until(async () => (await get(alarmPath)).count === 4);
-        assert.deepEqual((await get(alarmPath)).last, { hash: v7, scheduled: null });
+        await until(async () => (await get<Alarm>(alarmPath)).count === 4);
+        assert.deepEqual((await get<Alarm>(alarmPath)).last, { hash: v7, scheduled: null });
         pass("drain deferrals leave the hard deadline intact and deliver after forced swap");
         // Fault injection stays in the test bundle, not in the demo's alarm API.
         const alarmSource = await readFile(appPath, "utf8");
@@ -400,8 +453,11 @@ test.provider(
           );
           const retryHash = await deploy("alarm-retry", "g2");
           await schedule(Date.now() + 100);
-          await until(async () => (await get(alarmPath)).count === 5);
-          assert.deepEqual((await get(alarmPath)).last, { hash: retryHash, scheduled: null });
+          await until(async () => (await get<Alarm>(alarmPath)).count === 5);
+          assert.deepEqual((await get<Alarm>(alarmPath)).last, {
+            hash: retryHash,
+            scheduled: null,
+          });
           pass("facet exception reaches native retry; serializable retry metadata reaches handler");
         } finally {
           await writeFile(appPath, alarmSource);

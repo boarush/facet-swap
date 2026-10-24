@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 
 import { afterEach, test, vi } from "vitest";
 
+import type { Env } from "../alchemy.run";
+
 vi.mock("cloudflare:workers", () => ({
   DurableObject: class {
-    constructor(ctx, env) {
+    ctx: DurableObjectState;
+    env: unknown;
+    constructor(ctx: DurableObjectState, env: unknown) {
       this.ctx = ctx;
       this.env = env;
     }
@@ -12,55 +16,76 @@ vi.mock("cloudflare:workers", () => ({
 }));
 vi.mock("../src/version-source", () => ({
   VersionSource: class {
-    constructor(env) {
+    env: { latest: string };
+    constructor(env: { latest: string }) {
       this.env = env;
     }
-    async check(onLatest) {
+    async check(onLatest: (hash: string) => void) {
       onLatest(this.env.latest);
     }
   },
-  loadApp: async (_env, hash) => ({ class: hash }),
+  loadApp: async (_env: Env, hash: string) => ({ class: hash }),
 }));
 const { Supervisor } = await import("../src/supervisor");
 
 afterEach(() => vi.useRealTimers());
 
 function harness() {
-  const data = new Map([
+  const data = new Map<string, unknown>([
     ["app-config", { current: { hash: "v1", readOnly: false }, pending: null }],
   ]);
-  let native = null;
+  let native: number | null = null;
   const kv = {
-    get: (key) => structuredClone(data.get(key)),
-    put: (key, value) => data.set(key, structuredClone(value)),
-    delete: (key) => data.delete(key),
+    get: (key: string) => structuredClone(data.get(key)),
+    put: (key: string, value: unknown) => data.set(key, structuredClone(value)),
+    delete: (key: string) => data.delete(key),
+  };
+  type Storage = {
+    kv: typeof kv;
+    get(key: string): Promise<unknown>;
+    put(key: string, value: unknown): Promise<void>;
+    delete(key: string): Promise<boolean>;
+    setAlarm(time: number | Date): Promise<void>;
+    deleteAlarm(): Promise<void>;
   };
   const storage = {
     kv,
-    get: async (key) => kv.get(key),
-    put: async (key, value) => {
+    get: async (key: string) => kv.get(key),
+    put: async (key: string, value: unknown) => {
       kv.put(key, value);
     },
-    delete: async (key) => kv.delete(key),
-    setAlarm: async (time) => {
+    delete: async (key: string) => kv.delete(key),
+    setAlarm: async (time: number | Date) => {
       native = Number(time);
     },
     deleteAlarm: async () => {
       native = null;
     },
-    transaction: async (fn) => fn(storage),
+    transaction: async <T>(fn: (transaction: Storage) => Promise<T>): Promise<T> => fn(storage),
   };
-  const facet = { dispatchAlarm: vi.fn(async () => {}) };
+  const facet = {
+    dispatchAlarm: vi.fn<(info?: AlarmInvocationInfo) => Promise<void>>(async () => {}),
+    fetch: async (_request: Request): Promise<Response> => new Response(),
+  };
   const ctx = {
     id: { toString: () => "user" },
     storage,
-    facets: { get: vi.fn(() => facet), abort: vi.fn() },
+    facets: {
+      get: vi.fn<() => typeof facet>(() => facet),
+      abort: vi.fn<(name: string, reason: Error) => void>(),
+    },
   };
   const env = { latest: "v1", DRAIN_DEADLINE_MS: "3000" };
-  const create = () => new Supervisor(ctx, env);
+  // These partial fakes deliberately model only the Supervisor's exercised dependencies.
+  const create = () => new Supervisor(ctx as unknown as DurableObjectState, env as unknown as Env);
   const supervisor = create();
   const status = async (s = supervisor) =>
-    (await s.fetch(new Request("http://local/__status"))).json();
+    (await s.fetch(new Request("http://local/__status"))).json<{
+      current: { hash: string; readOnly: boolean } | null;
+      pending: { hash: string; readOnly: boolean } | null;
+      inflight: number;
+      swapping: boolean;
+    }>();
   return { supervisor, create, storage, data, facet, ctx, env, status, native: () => native };
 }
 
@@ -81,7 +106,7 @@ test("failed delivery persists across Supervisor restart and is retried on lates
   assert.equal(restarted.getAlarm(), due);
   await restarted.alarm({ scheduledTime: due, retryCount: 1, isRetry: true });
   assert.equal(restarted.getAlarm(), null);
-  assert.equal((await h.status(restarted)).current.hash, "v2");
+  assert.equal((await h.status(restarted)).current!.hash, "v2");
   assert.deepEqual(h.facet.dispatchAlarm.mock.calls[1][0], {
     scheduledTime: due,
     retryCount: 1,
@@ -133,10 +158,10 @@ test("an executing alarm counts as inflight and a hard swap retries it on new co
   const h = harness();
   const due = Date.now() - 1;
   await h.supervisor.setAlarm(due);
-  let interrupt;
+  let interrupt: ((reason: Error) => void) | undefined;
   h.facet.dispatchAlarm.mockImplementationOnce(
     () =>
-      new Promise((_resolve, reject) => {
+      new Promise<void>((_resolve, reject) => {
         interrupt = reject;
       }),
   );
@@ -147,10 +172,10 @@ test("an executing alarm counts as inflight and a hard swap retries it on new co
   h.env.latest = "v2";
   const response = await h.supervisor.fetch(new Request("http://local/version"));
   assert.equal(response.status, 503);
-  assert.equal((await h.status()).pending.hash, "v2");
+  assert.equal((await h.status()).pending!.hash, "v2");
   await vi.advanceTimersByTimeAsync(3000);
   await rejected;
-  assert.equal((await h.status()).current.hash, "v2");
+  assert.equal((await h.status()).current!.hash, "v2");
   assert.equal((await h.status()).inflight, 0);
   assert.equal(h.supervisor.getAlarm(), due);
   await h.supervisor.alarm();
@@ -167,7 +192,7 @@ test("pending swap and due alarm both survive reconstruction without a fresh dra
   });
   h.env.latest = "v2";
   const restarted = h.create();
-  assert.equal((await h.status(restarted)).current.hash, "v2");
+  assert.equal((await h.status(restarted)).current!.hash, "v2");
   assert.equal((await h.status(restarted)).pending, null);
   assert.equal(restarted.getAlarm(), due);
   await restarted.alarm();
@@ -177,12 +202,12 @@ test("pending swap and due alarm both survive reconstruction without a fresh dra
 test("Hono control routes retain update-check ordering and do not reach the facet", async () => {
   const h = harness();
   h.env.latest = "v2";
-  assert.equal((await h.status()).current.hash, "v1");
+  assert.equal((await h.status()).current!.hash, "v1");
   assert.equal(h.ctx.facets.abort.mock.calls.length, 0);
   const methodError = await h.supervisor.fetch(new Request("http://local/__scope"));
   assert.equal(methodError.status, 405);
   assert.equal(await methodError.text(), "Method not allowed");
-  assert.equal((await h.status()).current.hash, "v2");
+  assert.equal((await h.status()).current!.hash, "v2");
   const invalid = await h.supervisor.fetch(
     new Request("http://local/__scope", { method: "PUT", body: '{"readOnly":"yes"}' }),
   );
@@ -198,7 +223,7 @@ test("Hono control routes retain update-check ordering and do not reach the face
 
 test("HEAD cancels the Supervisor response wrapper instead of leaking inflight", async () => {
   const h = harness();
-  const cancelled = vi.fn();
+  const cancelled = vi.fn<(reason?: unknown) => void>();
   h.facet.fetch = async () =>
     new Response(new ReadableStream({ cancel: cancelled }), {
       headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
