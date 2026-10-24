@@ -65,7 +65,7 @@ The scope route never reaches the facet. It is unauthenticated local test machin
 
 Adding or changing real resources belongs on the gateway, not the Supervisor. The forwarding API must remain compatible; adding entirely new capability methods still requires teaching the trusted forwarding entrypoint how to expose them. This is a small concrete sketch, not a generic capability broker.
 
-There is a verified **local-provider limitation** in Alchemy beta.83. Changing only the gateway's revision restarts Gateway while Api logs "No changes, using existing instance". The Supervisor's open stream survives, but its existing service channel continues reporting the old gateway revision. The integration test records this explicitly; it does **not** prove that gateway redeployments become visible without restarting Api. Do not treat local success as a production rollout guarantee. A production service-binding deployment test remains outstanding.
+There is a verified **local-provider limitation** in Alchemy beta.84. Changing only the gateway's revision restarts Gateway while Api logs "No changes, using existing instance". The Supervisor's open stream survives, but its existing service channel continues reporting the old gateway revision. The integration test records this explicitly; it does **not** prove that gateway redeployments become visible without restarting Api. Do not treat local success as a production rollout guarantee. A production service-binding deployment test remains outstanding.
 
 ## Publishing Is Part of the Stack
 
@@ -205,7 +205,7 @@ Oxlint runs type-aware correctness rules, the Effect recommended preset, Promise
 
 The installed compiler is TypeScript 7.0.2. `npm run check` invokes its native compiler through `tsc --noEmit`. Effect's `@effect/tsgo` integration patches TypeScript, Oxlint, and its `oxlint-tsgolint` backend during the prepare hook. Those three packages are pinned to versions supported by the installed integration; upgrade them together against its compatibility table. Effect diagnostics run through Oxlint, not twice through both lint and typecheck (`diagnostics: false` in the plugin options). JavaScript scripts and tests are included in the TypeScript program for type-aware linting, without enabling `checkJs`. The configuration retains the `@effect/language-service` plugin key, but the old JavaScript plugin package is not installed. Editors should use the Effect native language server.
 
-Alchemy is pinned to beta.83, with an npm override to workerd 1.20261021.1 for the tested facet runtime. No custom workerd launcher or plain Wrangler fallback is used.
+Alchemy and its separate `@alchemy.run/cloudflare` provider are pinned to beta.84. Cloudflare imports and inferred binding types come from the provider package; bundling, Actions, local state, and the Vitest adapter remain in core Alchemy. The provider runtime pins workerd 1.20261012.1, which passes the facet integration suite without a direct workerd dependency or npm override. Both stack Workers and dynamically loaded facets use compatibility date 2026-10-12, within that binary's supported range. No custom workerd launcher or plain Wrangler fallback is used.
 
 ## What the Integration Test Proves
 
