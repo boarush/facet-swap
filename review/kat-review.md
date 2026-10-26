@@ -51,7 +51,7 @@ The Supervisor stages any truthy `latest`. With no rollback, a malformed value o
 3. [x] Hash validation + loader preflight before staging pending.
 4. [x] `/__scope` no-op when unchanged.
 5. [x] Validate `DRAIN_DEADLINE_MS` / `CHECK_INTERVAL_MS` at stack evaluation.
-6. [ ] Await `getAlarm()` before demo alarm writes.
+6. [x] Await `getAlarm()` before demo alarm writes.
 7. [ ] Pin `@cloudflare/workers-types` to the runtime version and `typescript` exactly.
 8. [ ] Serialize the source-mutating facet test.
 9. [ ] README: `router.ts` changes redeploy the Supervisor; stale-KV note.

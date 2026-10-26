@@ -19,11 +19,12 @@ export class App extends DurableObject<AppEnv> {
   }
 
   async alarm(_info?: AlarmInvocationInfo): Promise<void> {
-    const count = this.ctx.storage.kv.get<number>("alarms") ?? 0;
-    this.ctx.storage.kv.put("alarms", count + 1);
-    this.ctx.storage.kv.put("last-alarm", {
-      hash: this.env.HASH,
-      scheduled: await this.env.SCHEDULER.getAlarm(),
+    // RPC before any write, so a failed call leaves nothing behind for the retry to double.
+    const scheduled = await this.env.SCHEDULER.getAlarm();
+    this.ctx.storage.transactionSync(() => {
+      const count = this.ctx.storage.kv.get<number>("alarms") ?? 0;
+      this.ctx.storage.kv.put("alarms", count + 1);
+      this.ctx.storage.kv.put("last-alarm", { hash: this.env.HASH, scheduled });
     });
   }
 
