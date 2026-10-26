@@ -317,6 +317,17 @@ test("Hono control routes retain update-check ordering and do not reach the face
   assert.equal(h.ctx.facets.get.mock.calls.length, 0);
 });
 
+test("unchanged scope is a no-op instead of a drain", async () => {
+  const h = harness();
+  const { readOnly } = (await h.status()).current!;
+  const response = await h.supervisor.fetch(
+    new Request("http://local/__scope", { method: "PUT", body: JSON.stringify({ readOnly }) }),
+  );
+  assert.deepEqual(await response.json(), { accepted: true, changed: false });
+  assert.equal((await h.status()).pending, null);
+  assert.equal((await h.swaps()).length, 0);
+});
+
 test("HEAD cancels the Supervisor response wrapper instead of leaking inflight", async () => {
   const h = harness();
   const cancelled = vi.fn<(reason?: unknown) => void>();

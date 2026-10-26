@@ -83,6 +83,9 @@ export class Supervisor extends DurableObject<Env> {
       if (typeof body.readOnly !== "boolean") return new Response("Invalid scope", { status: 400 });
       const target = this.state.pending ?? this.state.current;
       if (!target) return new Response("Publish a version first", { status: 503 });
+      // Same scope means same facet env; draining would only cost availability.
+      if (target.readOnly === body.readOnly)
+        return Response.json({ accepted: true, changed: false });
       this.stage({ ...target, readOnly: body.readOnly });
       return Response.json({ accepted: true });
     })
