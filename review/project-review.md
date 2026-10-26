@@ -7,12 +7,12 @@
 
 All existing checks pass:
 
-| Command | Result |
-| --- | --- |
-| `npm run check` | ✅ |
-| `npm run lint` | ✅ |
-| `npm run fmt:check` | ✅ |
-| `npm test` | ✅ 21 tests, ~35s |
+| Command             | Result            |
+| ------------------- | ----------------- |
+| `npm run check`     | ✅                |
+| `npm run lint`      | ✅                |
+| `npm run fmt:check` | ✅                |
+| `npm test`          | ✅ 21 tests, ~35s |
 
 The prototype does what the README describes: a stable Supervisor drains admitted work, swaps a content-hashed facet, preserves facet storage, scopes capabilities, publishes through Alchemy Actions, proxies alarms, and records bounded swap history.
 
@@ -122,8 +122,7 @@ Normal loopback props deliver a boolean, but a missing field would silently gran
 ```ts
 if (typeof this.ctx.props?.user !== "string" || !/^[0-9a-f]{64}$/.test(this.ctx.props.user))
   throw new Error("Invalid notes scope");
-if (typeof this.ctx.props.readOnly !== "boolean")
-  throw new Error("Invalid notes scope");
+if (typeof this.ctx.props.readOnly !== "boolean") throw new Error("Invalid notes scope");
 ```
 
 Do the same for `Scheduler`'s `user` prop.
