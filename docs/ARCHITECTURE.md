@@ -71,7 +71,7 @@ The scope route never reaches the facet. It is unauthenticated local test machin
 
 Adding or changing real resources belongs on the gateway, not the Supervisor. The forwarding API must remain compatible; adding entirely new capability methods still requires teaching the trusted forwarding entrypoint how to expose them.
 
-In Alchemy beta.84's local provider, a gateway-only revision change restarts Gateway while Api keeps its existing instance. The Supervisor's open stream survives, but its service channel continues reporting the previous gateway revision. The integration test records this limitation. A manual Cloudflare trial reaches the new gateway from an existing Supervisor; the stale channel is reproducible only locally so far. There is no automated production rollout test.
+In Alchemy's local provider, a gateway-only revision change restarts Gateway while Api keeps its existing instance. The Supervisor's open stream survives, but its service channel continues reporting the previous gateway revision. The integration test records this limitation. A manual Cloudflare trial reaches the new gateway from an existing Supervisor; the stale channel is reproducible only locally so far. There is no automated production rollout test.
 
 ## Publishing Is Part of the Stack
 

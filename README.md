@@ -15,19 +15,7 @@ The [architecture guide](docs/ARCHITECTURE.md) covers capabilities, publication,
 `scripts/deploy.ts` triggers stack evaluation; `test/` holds integration and regression tests.
 `docs/ARCHITECTURE.md` describes runtime and deployment boundaries; `docs/DEVELOPMENT.md` covers development.
 
-## Setup
-
-Use Node 24.11.1+ within the 24.x line, or Node 25.1+, and npm. The local stack needs no Cloudflare credentials.
-
-```sh
-npm ci
-npm run check
-npm run lint
-npm run fmt:check
-npm test
-```
-
-`npm run fmt` formats the project. `npm run dev` starts local Alchemy; `npm run deploy` reconciles the running dev stack, not a production deployment.
+Install dependencies using the [development guide](docs/DEVELOPMENT.md). The local stack needs no Cloudflare credentials.
 
 ## Run the Demo
 
@@ -44,7 +32,7 @@ npm run deploy
 curl -N 'http://127.0.0.1:18743/u/alice/stream?n=20&ms=500'
 ```
 
-While it runs, edit `src/app.ts` and run `npm run deploy` again. Alternatively, `npm run deploy -- demo-update` changes only the optional label salt to produce a new hash.
+While it runs, edit `src/app.ts` and run `npm run deploy` again. See [Development](docs/DEVELOPMENT.md#local-execution) for label-only updates and deploy behavior.
 
 After Done, request `/u/alice/version`. During the drain it returns 503 with retry and current/pending hash headers. Wait at least one second plus jitter and retry. Once the stream finishes or the deadline cuts it, the response shows the new hash and the preserved served counter. A cut SSE stream ends with a best-effort `update-abort` event. Bob's requests are unaffected by Alice's drain.
 
