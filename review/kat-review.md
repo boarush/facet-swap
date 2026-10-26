@@ -42,12 +42,16 @@ The Supervisor stages any truthy `latest`. With no rollback, a malformed value o
 
 ## Actionables
 
-1. [ ] Monotonic publication generation; Supervisor ignores non-increasing reads.
-2. [ ] KV check failures serve current and retry next interval.
-3. [ ] Hash validation + loader preflight before staging pending.
+1. [x] Monotonic publication generation; Supervisor ignores non-increasing reads.
+2. [x] KV check failures serve current and retry next interval.
+3. [x] Hash validation + loader preflight before staging pending.
 4. [ ] `/__scope` no-op when unchanged.
 5. [ ] Validate `DRAIN_DEADLINE_MS` / `CHECK_INTERVAL_MS` at stack evaluation.
 6. [ ] Await `getAlarm()` before demo alarm writes.
 7. [ ] Pin `@cloudflare/workers-types` to the runtime version and `typescript` exactly.
 8. [ ] Serialize the source-mutating facet test.
 9. [ ] README: `router.ts` changes redeploy the Supervisor; stale-KV note.
+
+Implemented actionables 1–3 on this branch. Publication generation is persisted in Alchemy Action output and increases even if the clock stalls or regresses. Supervisors persist the highest accepted generation, preflight before staging, and keep serving current on KV/R2/module failures. Republishing identical code advances ordering without starting another drain. An older content hash can still be deliberately redeployed with a newer generation.
+
+Tests cover stale/invalid publications, transient KV failures, missing R2 code followed by repair, real loader compilation failure, and monotonic generation under a stalled/regressing clock. Publication ordering assumes one serialized deploy writer using the same Alchemy state.

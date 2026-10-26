@@ -34,7 +34,7 @@ flowchart TB
   A -->|fixed Supervisor identity| S
   S -.->|native alarm invokes facet handler| F
   G -->|owns raw binding| NOTES[(R2 notes)]
-  S -.->|lazy read latest| KV[(KV latest hash)]
+  S -.->|lazy read latest| KV[(KV latest hash + generation)]
   S -->|get by content hash| L[Worker Loader]
   L -->|read module on load| R2[(R2 code/hash.js)]
   L -->|App class| F
@@ -73,7 +73,7 @@ There is a verified **local-provider limitation** in Alchemy beta.84. Changing o
 
 Alchemy's `Bundle.build` uses its rolldown helper to produce one ESM module from `src/app.ts`. The file's SHA-256 hash, not the aggregate bundle hash, addresses `code/<hash>.js`. There is no separate esbuild pipeline.
 
-Publication uses two built-in, diffed Alchemy Actions. **FacetCode** writes the module through `WriteBucketLocal`. **FacetLatest** consumes the upload's successful hash output and writes the KV value `latest`, with version and publication metadata, through `WriteNamespaceLocal`. This dependency prevents publication before the code object exists. Both use Alchemy's local emulators, not a custom HTTP publication endpoint.
+Publication uses two built-in, diffed Alchemy Actions. **FacetCode** writes the module through `WriteBucketLocal`. **FacetLatest** consumes the upload's successful hash output and writes `{ hash, generation }` to KV `latest`, with version and publication metadata, through `WriteNamespaceLocal`. This dependency prevents publication before the code object exists. Both use Alchemy's local emulators, not a custom HTTP publication endpoint.
 
 A stack evaluation still bundles the source to discover changes. Identical module bytes skip the R2 upload, and identical hash/version inputs skip the KV write. Editing application source changes the hash without a label bump. Changing the optional label also changes the module bytes, so it forces publication even when the source is unchanged. An unchanged source and label leave both publication metadata and upload time unchanged. A forced reconciliation deliberately reruns the Actions.
 
@@ -105,7 +105,9 @@ Keep the dev process running and wait for Alchemy's **Done** message before quer
 
 **Notice.** On incoming requests and application alarm deliveries, each Supervisor reads KV `latest` at most once every `CHECK_INTERVAL_MS`, which defaults to 10,000 milliseconds. Concurrent checks share a promise. There is no background update polling or update push. An idle object checks when traffic returns or its application alarm fires, and its interval permits.
 
-**Drain.** If the hash differs from the current and pending hashes, the Supervisor persists it as pending. New application requests immediately receive **503 Service Unavailable**; the Supervisor never queues or forwards them. Requests already admitted continue on the old facet.
+Before staging, the Supervisor validates a lowercase 64-character hash and positive safe-integer generation. It ignores generations at or below the highest current/pending generation, preventing stale KV reads from downgrading code. It reads R2 and invokes a side-effect-free default Worker entrypoint to compile/warm the loader without constructing the durable facet. KV read, missing-code, and module compilation failures keep serving current; the next eligible check retries. This validates module loading, not application behavior.
+
+**Drain.** A newer generation with a different target hash is persisted as pending. Republishing the same target hash only advances its generation, without another drain. New application requests immediately receive **503 Service Unavailable**; the Supervisor never queues or forwards them. Requests already admitted continue on the old facet.
 
 The response includes `Retry-After: 1`, `X-Current-Version`, `X-Pending-Version`, and `Cache-Control: no-store`. Version headers contain content hashes, not labels such as v1. Clients should wait at least the indicated seconds and add jitter before retrying, with a retry budget or cancellation policy. A 503 from this gate means the request did not reach the facet; other failures do not carry that guarantee. Local status and scope-control routes bypass application admission.
 
@@ -201,7 +203,7 @@ The application alarm schedule belongs to Supervisor storage; handler effects be
 
 For a real long-running application, the **facet itself** must checkpoint meaningful work periodically. The Supervisor does not provide automatic checkpoints. This demo persists its counter, but does not implement resumable stream checkpoints or a migration framework. Application migrations should be repeatable and compatible with forward-only updates.
 
-There is no rollback or canary path. A faulty release is corrected by publishing another version. The Supervisor compares hashes, not ordered release numbers; forward-only publication is a release discipline, not an enforced version-order check.
+There is no rollback or canary path. A faulty release is corrected by publishing another version. The Supervisor enforces monotonically increasing publication generations, not ordered content hashes. Deliberately publishing an older hash with a newer generation is allowed. Generation is derived from the clock and the previous successful Alchemy Action output, so stalled/regressing clocks still advance it. Use one serialized deploy writer sharing the same Alchemy state; independent state stores or lost deployment state cannot guarantee global ordering.
 
 ## Project Layout & Tooling
 
@@ -258,4 +260,6 @@ Keep both runtime servers on loopback and do not tunnel them. Only trusted local
 
 Actions diff inputs rather than checking for storage drift. Deleting emulator data independently of Alchemy state requires a forced reconciliation. Old R2 code objects are retained for Supervisors that have not updated.
 
-Local KV does not reproduce production propagation delay. Crash-safe request recovery, WebSockets, production authentication, source-map publication, billing validation, and production rollout are outside this prototype. Load and application errors propagate; there is no fallback to old code.
+Local KV does not reproduce production propagation delay. Crash-safe request recovery, WebSockets, production authentication, source-map publication, billing validation, and production rollout are outside this prototype. Preflight failures retain the current code. Errors after a successful swap still propagate; there is no automatic runtime rollback.
+
+Update-safety tests exercise stale generations during a pending drain and after restart, transient KV failures with interval-limited retries, malformed hash/generation values, missing R2 code followed by repair, and actual loader compilation failure. Publication tests freeze/regress the clock and verify strictly increasing generations and unchanged-deploy no-ops.
