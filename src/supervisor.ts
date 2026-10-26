@@ -168,48 +168,46 @@ export class Supervisor extends DurableObject<Env> {
 
   private checkForUpdate(): Promise<void> {
     return this.versions.check(async (latest) => {
-      if (latest !== null && latest !== undefined) {
-        let config: AppConfig;
-        try {
-          if (
-            typeof latest !== "object" ||
-            !("hash" in latest) ||
-            typeof latest.hash !== "string" ||
-            !/^[0-9a-f]{64}$/.test(latest.hash) ||
-            !("generation" in latest) ||
-            typeof latest.generation !== "number" ||
-            !Number.isSafeInteger(latest.generation) ||
-            latest.generation < 1
-          )
-            throw new Error("Invalid facet publication");
-          const highest = Math.max(
-            this.state.current?.generation ?? 0,
-            this.state.pending?.generation ?? 0,
-          );
-          if (latest.generation <= highest) return;
-          const scope = {
-            user: this.ctx.id.toString(),
-            readOnly: this.target()?.readOnly ?? false,
-          };
-          await loadApp(this.env, latest.hash, scope, true);
-          // A scope change may land during preflight; never stage the stale permission.
-          // The module is already validated, so a new scope only needs a new loader env.
-          const readOnly = this.target()?.readOnly ?? false;
-          config = { hash: latest.hash, generation: latest.generation, readOnly };
-        } catch (error) {
-          console.error("Facet preflight failed; keeping current configuration", latest, error);
-          return;
-        }
-        const target = this.target();
-        if (target?.hash === config.hash) {
-          // A forced republication of identical code advances ordering, not the drain.
-          target.generation = config.generation;
-          this.ctx.storage.kv.put("app-config", this.state);
-        } else {
-          this.stage(config);
-        }
+      if (latest === null || latest === undefined) return;
+      let config: AppConfig;
+      try {
+        if (
+          typeof latest !== "object" ||
+          !("hash" in latest) ||
+          typeof latest.hash !== "string" ||
+          !/^[0-9a-f]{64}$/.test(latest.hash) ||
+          !("generation" in latest) ||
+          typeof latest.generation !== "number" ||
+          !Number.isSafeInteger(latest.generation) ||
+          latest.generation < 1
+        )
+          throw new Error("Invalid facet publication");
+        const highest = Math.max(
+          this.state.current?.generation ?? 0,
+          this.state.pending?.generation ?? 0,
+        );
+        if (latest.generation <= highest) return;
+        const scope = {
+          user: this.ctx.id.toString(),
+          readOnly: this.target()?.readOnly ?? false,
+        };
+        await loadApp(this.env, latest.hash, scope, true);
+        // A scope change may land during preflight; never stage the stale permission.
+        // The module is already validated, so a new scope only needs a new loader env.
+        const readOnly = this.target()?.readOnly ?? false;
+        config = { hash: latest.hash, generation: latest.generation, readOnly };
+      } catch (error) {
+        console.error("Facet preflight failed; keeping current configuration", latest, error);
+        return;
       }
-      this.swapWhenIdle();
+      const target = this.target();
+      if (target?.hash === config.hash) {
+        // A forced republication of identical code advances ordering, not the drain.
+        target.generation = config.generation;
+        this.ctx.storage.kv.put("app-config", this.state);
+      } else {
+        this.stage(config);
+      }
     });
   }
 
