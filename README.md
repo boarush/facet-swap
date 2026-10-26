@@ -207,7 +207,7 @@ There is no rollback or canary path. A faulty release is corrected by publishing
 
 ## Project Layout & Tooling
 
-`src/` holds runtime code: entry Worker, Supervisor, shared Hono router, version lookup and loading, response lifetime tracking, and the SSE application.
+`src/` holds runtime code: entry Worker, Supervisor, shared Hono router, version lookup and loading, response lifetime tracking, and the SSE application. `src/router.ts` is bundled into both the facet and the stable Workers, so editing it redeploys the entry Worker and Supervisor too, not just the facet.
 
 `alchemy.run.ts` holds the resources, facet bundling, and publication Effects. `scripts/` contains only the deploy CLI. `test/` contains typed Vitest integration and regression tests. `facet-version.ts` holds both the optional manual salt and the CLI's reconciliation nonce comment.
 
