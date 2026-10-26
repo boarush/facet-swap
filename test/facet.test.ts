@@ -79,10 +79,6 @@ async function until(fn: () => Promise<boolean>) {
   }
   throw new Error("Condition timed out");
 }
-type StreamRun<T> = { started: Promise<StreamEvent>; done: Promise<T> };
-type AbortedStream = { events: StreamEvent[]; updateAbort: UpdateAbort };
-function stream(user: string, n: number, ms: number, expectAbort: true): StreamRun<AbortedStream>;
-function stream(user: string, n: number, ms: number, expectAbort?: false): StreamRun<StreamEvent[]>;
 function stream(user: string, n: number, ms: number, expectAbort = false) {
   let first!: (event: StreamEvent) => void;
   let rejectStarted!: (reason: unknown) => void;
@@ -131,11 +127,7 @@ function stream(user: string, n: number, ms: number, expectAbort = false) {
       events.map((e) => e.seq),
       Array.from({ length: events.length }, (_, i) => i + 1),
     );
-    if (expectAbort) {
-      assert(updateAbort);
-      return { events, updateAbort };
-    }
-    return events;
+    return { events, updateAbort };
   })();
   // Surface startup errors to both consumers.
   void done.catch(rejectStarted);
@@ -236,7 +228,7 @@ test.provider(
           assert.equal(publication.hash, sourceHash);
           assert.notEqual(publication.metadata!.publication, before.metadata!.publication);
           assert(publication.generation > before.generation);
-          const sourceEvent = (await stream(sourceUser, 1, 0).done)[0];
+          const sourceEvent = (await stream(sourceUser, 1, 0).done).events[0];
           assert.equal(sourceEvent.hash, sourceHash);
           assert.equal(sourceEvent.v, sourceHash.slice(0, 12));
           assert.equal(sourceEvent.label, "v1");
@@ -281,7 +273,7 @@ test.provider(
         assert.equal(bob.hash, v2);
         assert.equal(bob.served, 0);
         pass("another user's supervisor updates independently during Alice's drain");
-        const oldEvents = await old.done;
+        const { events: oldEvents } = await old.done;
         assert(oldEvents.every((event) => event.label === "v1" && event.hash === v1));
         pass("all 25 SSE events finish on v1, without truncation or mixed versions");
         await until(async () => (await get<Status>("/u/" + a + "/__status")).pending === null);
@@ -299,7 +291,7 @@ test.provider(
         assert.equal(after.served, 1);
         pass("retry succeeds on v2 and facet SQLite counter survives abort");
         const fresh = stream(a, 3, 10);
-        const freshEvents = await fresh.done;
+        const { events: freshEvents } = await fresh.done;
         assert(
           freshEvents.every(
             (event) => event.label === "v2" && event.hash === v2 && event.served === 2,
@@ -377,7 +369,7 @@ test.provider(
           value: "alice only",
           gateway: "g1",
         });
-        assert.equal((await duringGateway.done).length, 25);
+        assert.equal((await duringGateway.done).events.length, 25);
         pass(
           "gateway redeploy preserves live stream; local binding stays on g1 (known limitation)",
         );
@@ -398,7 +390,7 @@ test.provider(
         });
         assert.equal((await note(b, "secret", "bob still writes")).status, 200);
         assert.equal((await get<Status>("/u/" + a + "/__status")).inflight, 1);
-        assert.equal((await drainingScope.done).length, 12);
+        assert.equal((await drainingScope.done).events.length, 12);
         await until(async () => (await get<Status>("/u/" + a + "/__status")).pending === null);
         assert.equal((await note(a, "secret", "must not write")).status, 403);
         assert.equal(
@@ -436,7 +428,7 @@ test.provider(
         const afterDeadline = await get("/u/" + a + "/version");
         assert.equal(afterDeadline.hash, v4);
         assert.equal((await get<Status>("/u/" + a + "/__status")).inflight, 0);
-        const nextStream = await stream(a, 3, 10).done;
+        const { events: nextStream } = await stream(a, 3, 10).done;
         assert(nextStream.every((event) => event.hash === v4));
         assert.equal(nextStream[0].served, afterDeadline.served + 1);
         pass("deadline emits final update-abort, cuts old facet, retry and fresh stream use v4");
@@ -519,7 +511,7 @@ test.provider(
         const v7 = await deploy("v7", "g2");
         await rejectedDuringDrain("/u/" + alarmUser + "/version", v6, v7);
         const forcedAlarm = await forcedAlarmDrain.done;
-        assert.equal(forcedAlarm.updateAbort.newVersion, v7);
+        assert.equal(forcedAlarm.updateAbort?.newVersion, v7);
         await until(async () => (await get<Alarm>(alarmPath)).count === 4);
         assert.deepEqual((await get<Alarm>(alarmPath)).last, { hash: v7, scheduled: null });
         pass("drain deferrals leave the hard deadline intact and deliver after forced swap");
