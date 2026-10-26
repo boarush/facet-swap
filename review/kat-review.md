@@ -55,7 +55,7 @@ The Supervisor stages any truthy `latest`. With no rollback, a malformed value o
 7. [ ] Pin `@cloudflare/workers-types` to the runtime version and `typescript` exactly.
 8. [ ] Serialize the source-mutating facet test.
 9. [ ] README: `router.ts` changes redeploy the Supervisor; stale-KV note.
-10. [ ] Key `FacetCode` on the hash; keep the bundle code out of Action state.
+10. [x] Key `FacetCode` on the hash; keep the bundle code out of Action state.
 
 Implemented actionables 1–3 on this branch. Publication generation is persisted in Alchemy Action output and increases even if the clock stalls or regresses. Supervisors persist the highest accepted generation, preflight before staging, and keep serving current on KV/R2/module failures. Republishing identical code advances ordering without starting another drain. An older content hash can still be deliberately redeployed with a newer generation.
 

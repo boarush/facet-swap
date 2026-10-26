@@ -5,6 +5,9 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Alchemy from "alchemy";
+import { toFqn } from "alchemy/FQN";
+import { CurrentNamespace } from "alchemy/Namespace";
+import { State } from "alchemy/State";
 import * as Test from "alchemy/Test/Vitest";
 import * as Effect from "effect/Effect";
 import { vi } from "vitest";
@@ -181,6 +184,21 @@ test.provider(
         assert.equal(repeated, v1);
         assert.deepEqual(await get<Publication>("/__local/publication"), before);
         pass("unchanged stack redeploy skips R2 upload and KV latest write");
+        const saved = JSON.stringify(
+          await Effect.runPromiseWith(context)(
+            Effect.gen(function* () {
+              // State is installed by Stack.make but omitted from its public services type.
+              const state = yield* Effect.serviceOption(State);
+              if (state._tag === "None") throw new Error("Missing stack state store");
+              const store = yield* state.value;
+              const { name, stage } = stack;
+              const fqn = toFqn(yield* CurrentNamespace, "FacetCode");
+              return yield* store.get({ stack: name, stage, fqn });
+            }),
+          ),
+        );
+        assert(saved.includes(v1) && !saved.includes("hello from"));
+        pass("upload Action state keeps the hash, not the bundle");
         // Only app source changes; the optional label stays fixed.
         const sourceUser = "source_" + process.pid;
         assert.equal((await get("/u/" + sourceUser + "/version")).hash, v1);

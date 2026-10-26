@@ -37,14 +37,16 @@ export const publishFacet = (
       "FacetCode",
       Effect.gen(function* () {
         const r2 = yield* Cloudflare.R2.WriteBucket(bucket);
-        return Effect.fn(function* (input: { code: string; hash: string }) {
-          const object = yield* r2.put("code/" + input.hash + ".js", input.code);
+        // Code comes from the closure: Action input is persisted and diffed, so it carries
+        // only the content hash and the bundle never lands in stack state.
+        return Effect.fn(function* (input: { hash: string }) {
+          const object = yield* r2.put("code/" + input.hash + ".js", bundle.code);
           if (!object) throw new Error("Facet upload did not return an object");
           return { hash: input.hash, uploaded: object.uploaded.toISOString() };
         });
       }).pipe(Effect.provide(Cloudflare.R2.WriteBucketLocal)),
     );
-    const uploaded = yield* Upload({ code: bundle.code, hash: bundle.hash });
+    const uploaded = yield* Upload({ hash: bundle.hash });
     const stack = yield* Alchemy.Stack;
     // Capture before apply replaces the Action's saved output with its running state.
     const key = {
