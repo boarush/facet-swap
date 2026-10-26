@@ -59,7 +59,7 @@ export class App extends DurableObject<AppEnv> {
     })
     .all("/alarm", () => new Response("Method not allowed", { status: 405 }))
     .on(["GET", "PUT"], "/notes", async (c) => {
-      // URLSearchParams preserves the original decoding behavior for capability keys.
+      // Decode capability keys with URLSearchParams.
       const key = new URL(c.req.url).searchParams.get("key") ?? "note";
       try {
         if (c.req.method === "PUT") {

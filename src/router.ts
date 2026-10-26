@@ -2,7 +2,7 @@ import { Hono } from "hono";
 
 export function createRouter<Bindings extends object>() {
   return new Hono<{ Bindings: Bindings }>({
-    // Keep encoded paths literal, like the original URL.pathname routes.
+    // Keep encoded paths literal.
     getPath: (request) => new URL(request.url).pathname,
   })
     .use(async (c, next) => {

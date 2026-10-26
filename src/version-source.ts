@@ -33,7 +33,6 @@ export class VersionSource {
   }
 }
 
-// The loader cache is keyed by content hash, not by a mutable version label.
 export async function loadApp(env: Env, hash: string, scope: NotesScope, preflight = false) {
   const readCode = async () => {
     const object = await env.CODE.get("code/" + hash + ".js");
