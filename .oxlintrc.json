@@ -7,7 +7,7 @@
   "ignorePatterns": [".alchemy/**", "audit.json"],
   "overrides": [
     {
-      "files": ["src/**/*.ts", "infra/**/*.ts", "alchemy.run.ts"],
+      "files": ["src/**/*.ts", "alchemy.run.ts"],
       "rules": {
         "no-restricted-imports": [
           "error",
@@ -30,18 +30,11 @@
           {
             "patterns": [
               {
-                "group": [
-                  "**/scripts",
-                  "**/scripts/**",
-                  "**/test",
-                  "**/test/**",
-                  "**/infra",
-                  "**/infra/**"
-                ],
-                "message": "Worker runtime cannot import infrastructure, CLI entrypoints or tests."
+                "group": ["**/scripts", "**/scripts/**", "**/test", "**/test/**"],
+                "message": "Worker runtime cannot import CLI entrypoints or tests."
               },
               {
-                "group": ["**/alchemy.run"],
+                "group": ["**/alchemy.run", "**/alchemy.run.ts"],
                 "allowTypeImports": true,
                 "message": "Stack imports must be type-only so infrastructure stays out of Worker bundles."
               }

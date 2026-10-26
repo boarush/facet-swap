@@ -19,7 +19,6 @@
   },
   "include": [
     "src/**/*.ts",
-    "infra/**/*.ts",
     "alchemy.run.ts",
     "facet-version.ts",
     "vitest.config.ts",

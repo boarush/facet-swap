@@ -12,8 +12,7 @@ import * as Test from "alchemy/Test/Vitest";
 import * as Effect from "effect/Effect";
 import { vi } from "vitest";
 
-import { resources } from "../alchemy.run.ts";
-import { bundleFacet } from "../infra/facet";
+import { bundleFacet, resources } from "../alchemy.run.ts";
 import type { UpdateAbort } from "../src/stream-lifetime";
 
 const port = await new Promise<number>((resolve) => {

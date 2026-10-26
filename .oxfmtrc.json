@@ -16,17 +16,10 @@
     "customGroups": [
       {
         "groupName": "project",
-        "elementNamePattern": [
-          "**/alchemy.run",
-          "**/alchemy.run.ts",
-          "./infra/**",
-          "../infra/**",
-          "./src/**",
-          "../src/**"
-        ]
+        "elementNamePattern": ["**/alchemy.run", "**/alchemy.run.ts", "./src/**", "../src/**"]
       }
     ],
-    "internalPattern": ["~/", "@/", "#", "infra/", "src/"],
+    "internalPattern": ["~/", "@/", "#", "src/"],
     "newlinesBetween": true,
     "sortSideEffects": false
   },
