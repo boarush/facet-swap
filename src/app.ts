@@ -143,3 +143,6 @@ export class App extends DurableObject<AppEnv> {
     });
   }
 }
+
+// Loader preflight compiles the module without constructing or invoking the durable facet.
+export default { fetch: () => new Response(null, { status: 204 }) };

@@ -1,6 +1,9 @@
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import * as Alchemy from "alchemy";
 import * as Bundle from "alchemy/Bundle";
+import { toFqn } from "alchemy/FQN";
+import { CurrentNamespace } from "alchemy/Namespace";
+import { isActionState, State } from "alchemy/State";
 import * as Effect from "effect/Effect";
 
 export const bundleFacet = (version: string) =>
@@ -42,16 +45,33 @@ export const publishFacet = (
       }).pipe(Effect.provide(Cloudflare.R2.WriteBucketLocal)),
     );
     const uploaded = yield* Upload({ code: bundle.code, hash: bundle.hash });
+    const stack = yield* Alchemy.Stack;
+    // Capture before apply replaces the Action's saved output with its running state.
+    const key = {
+      stack: stack.name,
+      stage: stack.stage,
+      fqn: toFqn(yield* CurrentNamespace, "FacetLatest"),
+    };
+    // State is installed by Stack.make but omitted from its public StackServices type.
+    const state = yield* Effect.serviceOption(State);
+    if (state._tag === "None") throw new Error("Publication requires the stack state store");
+    const store = yield* state.value;
+    const previous = yield* store.get(key).pipe(Effect.orDie);
+    const output =
+      isActionState(previous) && previous.status === "ran"
+        ? (previous.output as { generation?: number })
+        : undefined;
     const Publish = Alchemy.Action(
       "FacetLatest",
       Effect.gen(function* () {
         const kv = yield* Cloudflare.KV.WriteNamespace(namespace);
         return Effect.fn(function* (input: { hash: string; version: string }) {
           const publication = crypto.randomUUID();
-          yield* kv.put("latest", input.hash, {
+          const generation = Math.max(Date.now(), (output?.generation ?? 0) + 1);
+          yield* kv.put("latest", JSON.stringify({ hash: input.hash, generation }), {
             metadata: { publication, version: input.version },
           });
-          return { hash: input.hash, publication };
+          return { hash: input.hash, generation, publication };
         });
       }).pipe(Effect.provide(Cloudflare.KV.WriteNamespaceLocal)),
     );

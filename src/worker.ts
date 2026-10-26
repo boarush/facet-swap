@@ -1,6 +1,7 @@
 import type { Env } from "../alchemy.run";
 
 import { createRouter } from "./router";
+import type { Publication } from "./version-source";
 
 export { ScopedNotes } from "./notes";
 export { Scheduler } from "./scheduler";
@@ -19,12 +20,14 @@ const app = createRouter<Env>();
 // These diagnostics historically accept every method.
 app.all("/health", () => new Response("ready"));
 app.all("/__local/publication", async (c) => {
-  const latest = await c.env.VERSIONS.getWithMetadata<{ publication: string; version: string }>(
-    "latest",
-  );
-  const object = latest.value ? await c.env.CODE.head("code/" + latest.value + ".js") : null;
+  const latest = await c.env.VERSIONS.getWithMetadata<
+    Publication,
+    { publication: string; version: string }
+  >("latest", "json");
+  const object = latest.value ? await c.env.CODE.head("code/" + latest.value.hash + ".js") : null;
   return Response.json({
-    hash: latest.value,
+    hash: latest.value?.hash ?? null,
+    generation: latest.value?.generation ?? null,
     metadata: latest.metadata,
     uploaded: object?.uploaded.toISOString(),
   });

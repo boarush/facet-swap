@@ -4,10 +4,13 @@ import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 
 import * as Cloudflare from "@alchemy.run/cloudflare";
+import * as Alchemy from "alchemy";
 import * as Test from "alchemy/Test/Vitest";
 import * as Effect from "effect/Effect";
+import { vi } from "vitest";
 
 import { resources } from "../alchemy.run.ts";
+import { bundleFacet } from "../infra/facet";
 import type { UpdateAbort } from "../src/stream-lifetime";
 
 const port = await new Promise<number>((resolve) => {
@@ -30,7 +33,7 @@ const { test } = Test.make({
 });
 type Version = { v: string; hash: string; label?: string; served: number };
 type StreamEvent = Version & { seq: number; msg: string };
-type Config = { hash: string; readOnly: boolean };
+type Config = { hash: string; generation: number; readOnly: boolean };
 type Status = {
   current: Config | null;
   pending: Config | null;
@@ -49,6 +52,7 @@ type Swap = {
 };
 type Publication = {
   hash: string | null;
+  generation: number;
   metadata: { version: string; publication: string } | null;
   uploaded?: string;
 };
@@ -189,6 +193,7 @@ test.provider(
           const publication = await get<Publication>("/__local/publication");
           assert.equal(publication.hash, sourceHash);
           assert.notEqual(publication.metadata!.publication, before.metadata!.publication);
+          assert(publication.generation > before.generation);
           const sourceEvent = (await stream(sourceUser, 1, 0).done)[0];
           assert.equal(sourceEvent.hash, sourceHash);
           assert.equal(sourceEvent.v, sourceHash.slice(0, 12));
@@ -218,6 +223,7 @@ test.provider(
         assert.notEqual(v2, v1);
         const updated = await get<Publication>("/__local/publication");
         assert.equal(updated.hash, v2);
+        assert(updated.generation > before.generation);
         assert.equal(updated.metadata!.version, "v2");
         assert.notEqual(updated.metadata!.publication, before.metadata!.publication);
         assert.notEqual(updated.uploaded, before.uploaded);
@@ -342,6 +348,7 @@ test.provider(
         assert.equal(status.pending!.hash, v3);
         assert.equal(status.current!.readOnly, false);
         assert.equal(status.pending!.readOnly, true);
+        assert.equal(status.pending!.generation, status.current!.generation);
         assert.equal(status.inflight, 1);
         await rejectedDuringDrain("/u/" + a + "/notes?key=secret", v3, v3, {
           method: "PUT",
@@ -494,6 +501,89 @@ test.provider(
           pass("facet exception reaches native retry; serializable retry metadata reaches handler");
         } finally {
           await writeFile(appPath, alarmSource);
+        }
+        const stableHash = await deploy("preflight-base", "g2");
+        const preflightUser = "preflight_" + process.pid;
+        const versionPath = "/u/" + preflightUser + "/version";
+        assert.equal((await get(versionPath)).hash, stableHash);
+        const stablePublication = await get<Publication>("/__local/publication");
+        const nextBundle = await Effect.runPromiseWith(context)(bundleFacet("preflight-next"));
+        const inject = async (hash: string, generation: number, code: string | null = null) => {
+          await Effect.runPromiseWith(context)(
+            // Alchemy beta.84 exposes a broad deployment error channel.
+            // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context
+            stack.deploy(
+              Effect.gen(function* () {
+                const result = yield* resources("preflight-base", "g2");
+                const bucket = yield* Cloudflare.R2.Bucket("Code");
+                const namespace = yield* Cloudflare.KV.Namespace("Versions");
+                const Inject = Alchemy.Action(
+                  "TestPublication",
+                  Effect.gen(function* () {
+                    const kv = yield* Cloudflare.KV.WriteNamespace(namespace);
+                    const r2 = yield* Cloudflare.R2.WriteBucket(bucket);
+                    return Effect.fn(function* (input: {
+                      hash: string;
+                      generation: number;
+                      code: string | null;
+                      after: string;
+                    }) {
+                      if (input.code !== null)
+                        yield* r2.put("code/" + input.hash + ".js", input.code);
+                      yield* kv.put(
+                        "latest",
+                        JSON.stringify({
+                          hash: input.hash,
+                          generation: input.generation,
+                        }),
+                      );
+                    });
+                  }).pipe(
+                    Effect.provide([
+                      Cloudflare.KV.WriteNamespaceLocal,
+                      Cloudflare.R2.WriteBucketLocal,
+                    ]),
+                  ),
+                );
+                yield* Inject({ hash, generation, code, after: result.published.hash });
+                return result;
+              }),
+            ),
+          );
+        };
+        await inject("../bad", stablePublication.generation + 1);
+        assert.equal((await get(versionPath)).hash, stableHash);
+        await inject(nextBundle.hash, stablePublication.generation + 2);
+        assert.equal((await get(versionPath)).hash, stableHash);
+        assert.equal((await get<Status>("/u/" + preflightUser + "/__status")).pending, null);
+        await inject(nextBundle.hash, stablePublication.generation + 2, nextBundle.code);
+        assert.equal((await get(versionPath)).hash, nextBundle.hash);
+        await inject("0".repeat(64), stablePublication.generation + 3, "export default {");
+        assert.equal((await get(versionPath)).hash, nextBundle.hash);
+        await inject(stableHash, stablePublication.generation + 1);
+        assert.equal((await get(versionPath)).hash, nextBundle.hash);
+        pass(
+          "real loader rejects malformed/missing/uncompilable code, retries missing code, ignores stale KV",
+        );
+
+        // Ordering comes from persisted Action output even when the clock stalls/regresses.
+        const clock = vi.spyOn(Date, "now").mockReturnValue(8_000_000_000_000_000);
+        try {
+          await deploy("generation-a", "g2");
+          const first = await get<Publication>("/__local/publication");
+          await deploy("generation-b", "g2");
+          const second = await get<Publication>("/__local/publication");
+          assert.equal(second.generation, first.generation + 1);
+          clock.mockReturnValue(7_999_999_999_999_000);
+          await deploy("generation-a", "g2");
+          const third = await get<Publication>("/__local/publication");
+          assert.equal(third.generation, second.generation + 1);
+          assert.equal(third.hash, first.hash);
+          await deploy("generation-a", "g2");
+          assert.deepEqual(await get<Publication>("/__local/publication"), third);
+          pass("generation increases with a stalled/regressing clock; unchanged deploy is a no-op");
+        } finally {
+          clock.mockRestore();
         }
         console.log("ALL PASS");
       });

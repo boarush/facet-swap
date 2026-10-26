@@ -8,7 +8,7 @@ import { loadApp, VersionSource } from "./version-source";
 
 type ScheduledAlarm = { time: number; token: string };
 
-type AppConfig = { hash: string; readOnly: boolean };
+type AppConfig = { hash: string; generation: number; readOnly: boolean };
 type VersionState = {
   current: AppConfig | null;
   pending: AppConfig | null;
@@ -165,12 +165,41 @@ export class Supervisor extends DurableObject<Env> {
   }
 
   private checkForUpdate(): Promise<void> {
-    return this.versions.check((latest) => {
-      if (latest && latest !== this.state.current?.hash && latest !== this.state.pending?.hash) {
-        this.stage({
-          hash: latest,
-          readOnly: (this.state.pending ?? this.state.current)?.readOnly ?? false,
-        });
+    return this.versions.check(async (latest) => {
+      if (latest !== null && latest !== undefined) {
+        let config: AppConfig;
+        try {
+          if (
+            typeof latest !== "object" ||
+            !("hash" in latest) ||
+            typeof latest.hash !== "string" ||
+            !/^[0-9a-f]{64}$/.test(latest.hash) ||
+            !("generation" in latest) ||
+            typeof latest.generation !== "number" ||
+            !Number.isSafeInteger(latest.generation) ||
+            latest.generation < 1
+          )
+            throw new Error("Invalid facet publication");
+          const highest = Math.max(
+            this.state.current?.generation ?? 0,
+            this.state.pending?.generation ?? 0,
+          );
+          if (latest.generation <= highest) return;
+          const readOnly = (this.state.pending ?? this.state.current)?.readOnly ?? false;
+          await loadApp(this.env, latest.hash, { user: this.ctx.id.toString(), readOnly }, true);
+          config = { hash: latest.hash, generation: latest.generation, readOnly };
+        } catch (error) {
+          console.error("Facet preflight failed; keeping current configuration", latest, error);
+          return;
+        }
+        const target = this.state.pending ?? this.state.current;
+        if (target?.hash === config.hash) {
+          // A forced republication of identical code advances ordering, not the drain.
+          target.generation = config.generation;
+          this.ctx.storage.kv.put("app-config", this.state);
+        } else {
+          this.stage(config);
+        }
       }
       this.swapWhenIdle();
     });
