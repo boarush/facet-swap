@@ -10,7 +10,6 @@ import type { Notes } from "./src/gateway";
 import type { Supervisor } from "./src/supervisor";
 
 import version from "./facet-version";
-import "./infra/reconcile";
 
 export const bundleFacet = (version: string) =>
   Bundle.build(
