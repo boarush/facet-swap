@@ -28,7 +28,7 @@ export class App extends DurableObject<AppEnv> {
   }
 
   private readonly router = createRouter<AppEnv>()
-    .all("/version", (c) =>
+    .get("/version", (c) =>
       Response.json({
         v: c.env.HASH.slice(0, 12),
         label: VERSION || undefined,
@@ -36,6 +36,7 @@ export class App extends DurableObject<AppEnv> {
         served: this.ctx.storage.kv.get<number>("served") ?? 0,
       }),
     )
+    .all("/version", () => new Response("Method not allowed", { status: 405 }))
     .on(["GET", "PUT", "DELETE"], "/alarm", async (c) => {
       const request = c.req.raw;
       if (request.method === "PUT") {
@@ -74,7 +75,7 @@ export class App extends DurableObject<AppEnv> {
       }
     })
     .all("/notes", () => new Response("Method not allowed", { status: 405 }))
-    .all("/stream", (c) => {
+    .get("/stream", (c) => {
       const query = new URL(c.req.url).searchParams;
       const count = Number(query.get("n") ?? 10);
       const intervalMs = Number(query.get("ms") ?? 500);
@@ -94,7 +95,8 @@ export class App extends DurableObject<AppEnv> {
       this.ctx.storage.kv.put("served", served + 1);
       // Return the raw body so cancellation and Supervisor deadline tracking stay intact.
       return this.stream(count, intervalMs, served + 1);
-    });
+    })
+    .all("/stream", () => new Response("Method not allowed", { status: 405 }));
 
   async fetch(request: Request): Promise<Response> {
     return this.router.fetch(request, this.env);

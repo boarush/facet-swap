@@ -26,6 +26,9 @@ afterEach(() => vi.unstubAllGlobals());
 function entry() {
   const forwarded: { user: string; request: Request }[] = [];
   const env = {
+    VERSIONS: {
+      getWithMetadata: async () => ({ value: null, metadata: null }),
+    },
     SUPERVISORS: {
       idFromName: (user: string) => user,
       get: (user: string) => ({
@@ -86,7 +89,19 @@ test("entry routes keep exact paths, methods, raw user identity and forwarded re
     assert.equal(response.status, 404, path);
     assert.equal(await response.text(), "Not found");
   }
-  assert.equal(await (await h.fetch("/health", { method: "POST" })).text(), "ready");
+  assert.equal(await (await h.fetch("/health")).text(), "ready");
+  for (const path of ["/health", "/__local/publication"]) {
+    assert.equal((await h.fetch(path)).status, 200);
+    const head = await h.fetch(path, { method: "HEAD" });
+    assert.equal(head.status, 200);
+    assert.equal(head.body, null);
+    for (const method of ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"]) {
+      const response = await h.fetch(path, { method });
+      assert.equal(response.status, 405, path + " " + method);
+      assert.equal(await response.text(), "Method not allowed");
+    }
+  }
+  assert.equal(h.forwarded.length, 0);
   for (const [path, user, suffix] of [
     ["/u/alice", "alice", "/"],
     ["/u/alice/", "alice", "/"],
@@ -118,9 +133,19 @@ test("facet routes retain method errors, validation, query decoding and exact 40
     assert.equal(await response.text(), "Not found");
   }
   assert.equal(
-    (await (await h.fetch("/version", { method: "POST" })).json<{ hash: string }>()).hash,
+    (await (await h.fetch("/version")).json<{ hash: string }>()).hash,
     "1234567890abcdef",
   );
+  for (const path of ["/version", "/stream"]) {
+    for (const method of ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"]) {
+      const response = await h.fetch(path, { method });
+      assert.equal(response.status, 405, path + " " + method);
+      assert.equal(await response.text(), "Method not allowed");
+    }
+    const head = await h.fetch(path, { method: "HEAD" });
+    assert.equal(head.status, 200);
+    assert.equal(head.body, null);
+  }
   for (const path of ["/notes", "/alarm"]) {
     for (const method of ["POST", "PATCH", "OPTIONS", "HEAD"]) {
       const response = await h.fetch(path, { method });
@@ -137,7 +162,7 @@ test("facet routes retain method errors, validation, query decoding and exact 40
   assert.equal((await h.fetch("/alarm", { method: "PUT", body: '{"time":0}' })).status, 400);
   assert.equal((await h.fetch("/stream?n=0")).status, 400);
   assert.equal((await h.fetch("/stream?ms=Infinity")).status, 400);
-  const stream = await h.fetch("/stream?n=1&ms=0", { method: "POST" });
+  const stream = await h.fetch("/stream?n=1&ms=0");
   assert.equal(stream.headers.get("content-type"), "text/event-stream");
   assert.equal(stream.headers.get("cache-control"), "no-cache");
   assert.match(await stream.text(), /^id: 1\ndata: /);

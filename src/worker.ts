@@ -17,9 +17,8 @@ declare global {
 
 const app = createRouter<Env>();
 
-// These diagnostics historically accept every method.
-app.all("/health", () => new Response("ready"));
-app.all("/__local/publication", async (c) => {
+app.get("/health", () => new Response("ready"));
+app.get("/__local/publication", async (c) => {
   const latest = await c.env.VERSIONS.getWithMetadata<
     Publication,
     { publication: string; version: string }
@@ -32,6 +31,9 @@ app.all("/__local/publication", async (c) => {
     uploaded: object?.uploaded.toISOString(),
   });
 });
+for (const path of ["/health", "/__local/publication"]) {
+  app.all(path, () => new Response("Method not allowed", { status: 405 }));
+}
 app.all("/u/:user/*", (c) => {
   // Only strip the matched prefix; keep raw user IDs and the forwarded path encoded.
   const user = c.req.path.split("/")[2];
