@@ -45,7 +45,7 @@ export const publishFacet = (
         return Effect.fn(function* (input: { hash: string }) {
           const object = yield* r2.put("code/" + input.hash + ".js", bundle.code);
           if (!object) throw new Error("Facet upload did not return an object");
-          return { hash: input.hash, uploaded: object.uploaded.toISOString() };
+          return { hash: input.hash };
         });
       }).pipe(Effect.provide(Cloudflare.R2.WriteBucketLocal)),
     );
