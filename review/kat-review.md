@@ -29,7 +29,11 @@ The Supervisor stages any truthy `latest`. With no rollback, a malformed value o
 - `test/facet.test.ts` rewrites `src/app.ts` at runtime. Serialize that file (or the integration suite) and assert the replacement happened.
 - Document that `src/router.ts` is shared, so editing it redeploys the Supervisor too.
 
-### 5. Optional polish
+### 5. Keep the bundle out of Alchemy state
+
+`FacetCode` takes `{ code, hash }` as its Action input, so the whole facet bundle (~65 KB unminified today) is stored in `.alchemy/state/.../FacetCode.json`. It grows with the app and is read and diffed on every deploy, which gets worse with a remote state store. Key the Action on the hash only and read the code from the content-addressed bundle artifact at upload time. Minifying helps size, but doesn't fix the shape.
+
+### 6. Optional polish
 
 `hono/tiny`, minifying the facet bundle, and `Retry-After` derived from the remaining drain budget. Fine, low priority.
 
@@ -51,6 +55,7 @@ The Supervisor stages any truthy `latest`. With no rollback, a malformed value o
 7. [ ] Pin `@cloudflare/workers-types` to the runtime version and `typescript` exactly.
 8. [ ] Serialize the source-mutating facet test.
 9. [ ] README: `router.ts` changes redeploy the Supervisor; stale-KV note.
+10. [ ] Key `FacetCode` on the hash; keep the bundle code out of Action state.
 
 Implemented actionables 1–3 on this branch. Publication generation is persisted in Alchemy Action output and increases even if the clock stalls or regresses. Supervisors persist the highest accepted generation, preflight before staging, and keep serving current on KV/R2/module failures. Republishing identical code advances ordering without starting another drain. An older content hash can still be deliberately redeployed with a newer generation.
 
