@@ -31,8 +31,7 @@ function entry() {
       getWithMetadata: async () => ({ value: null, metadata: null }),
     },
     SUPERVISORS: {
-      idFromName: (user: string) => user,
-      get: (user: string) => ({
+      getByName: (user: string) => ({
         fetch: async (request: Request) => {
           forwarded.push({ user, request });
           return new Response("forwarded", { headers: { "x-test": "untouched" } });

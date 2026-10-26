@@ -10,7 +10,7 @@ This is a demonstration of controlled code replacement, not a guarantee against 
 
 ## The Core Idea
 
-The entry Worker routes `/u/<user>/stream` and `/u/<user>/version` to a Supervisor selected by `idFromName(user)`. Each Supervisor owns a facet named `app`.
+The entry Worker routes `/u/<user>/stream` and `/u/<user>/version` to a Supervisor selected by `getByName(user)`. Each Supervisor owns a facet named `app`.
 
 HTTP routing uses Hono in the entry Worker, Supervisor, and application facet. The shared router keeps exact, encoded path matching and propagates unexpected errors to the runtime.
 
@@ -27,7 +27,7 @@ The **Facet** contains the application logic. Worker Loader loads its module by 
 ```mermaid
 flowchart TB
   C[Client] --> E[Entry Worker]
-  E -->|idFromName user| S
+  E -->|getByName user| S
   subgraph DO[Durable Object per user]
     S[Stable Supervisor] -->|forward admitted requests| F[Named app facet]
     S --- SD[(Supervisor SQLite: configs, alarms, swap log)]

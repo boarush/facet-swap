@@ -39,9 +39,7 @@ app.all("/u/:user/*", (c) => {
   const user = c.req.path.split("/")[2];
   const url = new URL(c.req.url);
   url.pathname = c.req.path.slice("/u/".length + user.length) || "/";
-  return c.env.SUPERVISORS.get(c.env.SUPERVISORS.idFromName(user)).fetch(
-    new Request(url, c.req.raw),
-  );
+  return c.env.SUPERVISORS.getByName(user).fetch(new Request(url, c.req.raw));
 });
 
 export default { fetch: app.fetch } satisfies ExportedHandler<Env>;
