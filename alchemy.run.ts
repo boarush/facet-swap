@@ -86,6 +86,16 @@ export const publishFacet = (
     return yield* Publish({ hash: uploaded.hash, version: bundle.version });
   });
 
+// Fail at evaluation: Number("") or a typo would silently become 0 or NaN at runtime,
+// and a NaN deadline force-swaps instantly. setTimeout caps delays at 2^31 - 1.
+const milliseconds = (name: string, fallback: string) => {
+  const raw = process.env[name] ?? fallback;
+  if (!/^\d+$/.test(raw) || Number(raw) > 2 ** 31 - 1) {
+    throw new Error(name + " must be a whole number of milliseconds, got " + JSON.stringify(raw));
+  }
+  return raw;
+};
+
 export const gatewayWorker = (gatewayRevision = "g1") =>
   Effect.gen(function* () {
     const notes = yield* Cloudflare.R2.Bucket("Notes");
@@ -117,8 +127,8 @@ export const resources = (label = version, gatewayRevision = "g1") =>
         VERSIONS: versions,
         LOADER: Cloudflare.WorkerLoader(),
         SUPERVISORS: Cloudflare.DurableObject<Supervisor>("Supervisor"),
-        CHECK_INTERVAL_MS: process.env.CHECK_INTERVAL_MS ?? "10000",
-        DRAIN_DEADLINE_MS: process.env.DRAIN_DEADLINE_MS ?? "30000",
+        CHECK_INTERVAL_MS: milliseconds("CHECK_INTERVAL_MS", "10000"),
+        DRAIN_DEADLINE_MS: milliseconds("DRAIN_DEADLINE_MS", "30000"),
       },
       dev: { host: "127.0.0.1", port: Number(process.env.PORT ?? 18743), strictPort: true },
     });

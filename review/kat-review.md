@@ -50,7 +50,7 @@ The Supervisor stages any truthy `latest`. With no rollback, a malformed value o
 2. [x] KV check failures serve current and retry next interval.
 3. [x] Hash validation + loader preflight before staging pending.
 4. [x] `/__scope` no-op when unchanged.
-5. [ ] Validate `DRAIN_DEADLINE_MS` / `CHECK_INTERVAL_MS` at stack evaluation.
+5. [x] Validate `DRAIN_DEADLINE_MS` / `CHECK_INTERVAL_MS` at stack evaluation.
 6. [ ] Await `getAlarm()` before demo alarm writes.
 7. [ ] Pin `@cloudflare/workers-types` to the runtime version and `typescript` exactly.
 8. [ ] Serialize the source-mutating facet test.
