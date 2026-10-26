@@ -4,19 +4,20 @@ A local prototype of self-updating per-user services on Cloudflare Durable Objec
 
 Each user gets a Supervisor with a named `app` facet. Requests and application alarms lazily check KV for a newer publication. The Supervisor validates and warms the new module, stops admitting requests while old work drains, then commits the new configuration and recreates the facet. Clients retry admission 503s and interrupted streams.
 
-The [architecture guide](docs/ARCHITECTURE.md) covers capabilities, publication, swaps, streams, alarms, tests, and safety limits.
+The [architecture guide](docs/ARCHITECTURE.md) covers capabilities, publication, swaps, streams, alarms, and safety limits. The [development guide](docs/DEVELOPMENT.md) covers tooling, tests, and local deployment.
 
 ## Layout
 
 `src/` holds the entry Worker, Supervisor, gateway, scoped services, loader, and demo facet.
+`src/router.ts` is shared by the facet and stable Workers; editing it redeploys the entry Worker and Supervisor too.
 `alchemy.run.ts` declares resources, bundling, and publication.
 `facet-version.ts` holds an optional label salt and the deploy reconciliation nonce.
 `scripts/deploy.ts` triggers stack evaluation; `test/` holds integration and regression tests.
-`docs/ARCHITECTURE.md` describes the runtime and deployment boundaries.
+`docs/ARCHITECTURE.md` describes runtime and deployment boundaries; `docs/DEVELOPMENT.md` covers development.
 
 ## Setup
 
-Use Node 24.11.1+ within the 24.x line, or Node 25.1+, and npm. No Bun or Cloudflare credentials are needed.
+Use Node 24.11.1+ within the 24.x line, or Node 25.1+, and npm. The local stack needs no Cloudflare credentials.
 
 ```sh
 npm ci
