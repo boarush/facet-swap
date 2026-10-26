@@ -54,26 +54,25 @@ export class Supervisor extends DurableObject<Env> {
 
   private readonly router = createRouter<Env>()
     // Local diagnostics bypass update checks and admission.
-    .all("/__status", () =>
-      Response.json({
-        ...this.state,
-        inflight: this.active.size,
-        swapping: this.swapping,
-      }),
-    )
-    .get("/swaps", (c) => {
-      const raw = c.req.query("limit") ?? "20";
+    .get("/__status", (c) => {
+      const raw = c.req.query("swaps") ?? "20";
       const limit = Number(raw);
-      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(limit) || limit < 1) {
-        return new Response("Invalid limit", { status: 400 });
+      if (!/^\d+$/.test(raw) || !Number.isSafeInteger(limit)) {
+        return new Response("Invalid swaps", { status: 400 });
       }
       const swaps = this.ctx.storage.sql
         .exec<SwapRow>("SELECT * FROM swaps ORDER BY id DESC LIMIT ?", Math.min(limit, 100))
         .toArray()
         .map((row) => ({ ...row, forced: !!row.forced, restartCommit: !!row.restartCommit }));
-      return Response.json({ swaps });
+      return Response.json({
+        ...this.state,
+        pendingSince: this.state.pendingSince ?? null,
+        inflight: this.active.size,
+        swapping: this.swapping,
+        swaps,
+      });
     })
-    .all("/swaps", () => new Response("Method not allowed", { status: 405 }))
+    .all("/__status", () => new Response("Method not allowed", { status: 405 }))
     .use(async (_c, next) => {
       await this.checkForUpdate();
       await next();

@@ -146,11 +146,13 @@ function harness() {
     (await s.fetch(new Request("http://local/__status"))).json<{
       current: { hash: string; generation: number; readOnly: boolean } | null;
       pending: { hash: string; generation: number; readOnly: boolean } | null;
+      pendingSince: number | null;
+      swaps: Swap[];
       inflight: number;
       swapping: boolean;
     }>();
   const swaps = async (s = supervisor, query = "") => {
-    const response = await s.fetch(new Request("http://local/swaps" + query));
+    const response = await s.fetch(new Request("http://local/__status" + query));
     assert.equal(response.status, 200);
     return (await response.json<{ swaps: Swap[] }>()).swaps;
   };
@@ -348,6 +350,10 @@ test("normal body drain logs one unforced swap with its original pending time", 
   h.env.latest = hash(2);
   assert.equal((await h.supervisor.fetch(new Request("http://local/version"))).status, 503);
   assert.deepEqual(await h.swaps(), []);
+  const draining = await h.status();
+  assert.equal(draining.pendingSince, pendingSince);
+  assert.equal(draining.inflight, 1);
+  assert.equal(draining.swapping, false);
   await vi.advanceTimersByTimeAsync(100);
   h.env.latest = hash(3);
   assert.equal((await h.supervisor.fetch(new Request("http://local/version"))).status, 503);
@@ -425,24 +431,41 @@ test("swap diagnostics are read-only, bypass checks, and retain only the newest 
     await h.supervisor.fetch(new Request("http://local/version"));
   }
   h.env.latest = "not-observed";
-  const rows = await h.swaps(h.supervisor, "?limit=200");
+  h.env.VERSIONS.get.mockClear();
+  const rows = await h.swaps(h.supervisor, "?swaps=200");
   assert.equal(rows.length, 100);
   assert.equal(rows[0].newHash, hash(106));
   assert.equal(rows[99].newHash, hash(7));
   assert.equal((await h.swaps()).length, 20);
-  assert.equal((await h.swaps(h.supervisor, "?limit=1")).length, 1);
+  assert.equal((await h.swaps(h.supervisor, "?swaps=1")).length, 1);
   assert.equal((await h.status()).current!.hash, hash(106));
   assert.equal(h.storage.sql.exec("SELECT COUNT(*) AS count FROM swaps").toArray()[0].count, 100);
-  for (const limit of ["0", "-1", "1.5", "abc", "", "9007199254740992", "1%20OR%201"]) {
-    const response = await h.supervisor.fetch(new Request("http://local/swaps?limit=" + limit));
+  assert.deepEqual(await h.swaps(h.supervisor, "?swaps=0"), []);
+  for (const limit of ["-1", "1.5", "abc", "", "9007199254740992", "1%20OR%201"]) {
+    const response = await h.supervisor.fetch(new Request("http://local/__status?swaps=" + limit));
     assert.equal(response.status, 400);
   }
-  const head = await h.supervisor.fetch(new Request("http://local/swaps", { method: "HEAD" }));
+  const head = await h.supervisor.fetch(new Request("http://local/__status", { method: "HEAD" }));
   assert.equal(head.status, 200);
   assert.equal(head.body, null);
-  const response = await h.supervisor.fetch(new Request("http://local/swaps", { method: "POST" }));
-  assert.equal(response.status, 405);
-  assert.equal((await h.status()).current!.hash, hash(106));
+  for (const method of ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"]) {
+    const response = await h.supervisor.fetch(new Request("http://local/__status", { method }));
+    assert.equal(response.status, 405, method);
+    assert.equal(await response.text(), "Method not allowed");
+  }
+  const status = await h.status();
+  assert.deepEqual(Object.keys(status).sort(), [
+    "current",
+    "inflight",
+    "pending",
+    "pendingSince",
+    "swapping",
+    "swaps",
+  ]);
+  assert.equal(status.current!.hash, hash(106));
+  assert.equal(status.pendingSince, null);
+  assert.equal(h.env.VERSIONS.get.mock.calls.length, 0);
+  assert.equal(h.ctx.facets.get.mock.calls.length, 105);
 });
 
 test("initial activation and legacy pending state are logged without invented drain time", async () => {

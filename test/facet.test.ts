@@ -40,6 +40,8 @@ type Config = { hash: string; generation: number; readOnly: boolean };
 type Status = {
   current: Config | null;
   pending: Config | null;
+  pendingSince: number | null;
+  swaps: Swap[];
   inflight: number;
   swapping: boolean;
 };
@@ -177,6 +179,29 @@ test.provider(
         assert.equal(Object.hasOwn(initial, "label"), false);
         pass("no manual label needed; clients see a short content hash");
 
+        const diagnosticUser = "/u/unlabelled_" + process.pid;
+        for (const path of [
+          "/health",
+          "/__local/publication",
+          diagnosticUser + "/__status",
+          diagnosticUser + "/version",
+          diagnosticUser + "/stream",
+        ]) {
+          const head = await fetch(base + path, { method: "HEAD" });
+          assert.equal(head.status, 200, path);
+          assert.equal(await head.text(), "");
+          for (const method of ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"]) {
+            const response = await fetch(base + path, { method });
+            assert.equal(response.status, 405, path + " " + method);
+            assert.equal(await response.text(), "Method not allowed");
+          }
+        }
+        assert.equal((await get<Status>(diagnosticUser + "/__status?swaps=0")).inflight, 0);
+        assert.deepEqual((await get<Status>(diagnosticUser + "/__status?swaps=0")).swaps, []);
+        assert.equal((await fetch(base + diagnosticUser + "/__status?swaps=-1")).status, 400);
+        assert.equal((await fetch(base + diagnosticUser + "/swaps")).status, 404);
+        pass("diagnostics are GET/HEAD only; status includes optional swap history");
+
         const v1 = await deploy("v1");
         assert.notEqual(v1, unlabelled);
         const before = await get<Publication>("/__local/publication");
@@ -261,7 +286,7 @@ test.provider(
         assert(oldEvents.every((event) => event.label === "v1" && event.hash === v1));
         pass("all 25 SSE events finish on v1, without truncation or mixed versions");
         await until(async () => (await get<Status>("/u/" + a + "/__status")).pending === null);
-        const history = await get<{ swaps: Swap[] }>("/u/" + a + "/swaps?limit=1");
+        const history = await get<Status>("/u/" + a + "/__status?swaps=1");
         assert.equal(history.swaps.length, 1);
         assert.equal(history.swaps[0].oldHash, v1);
         assert.equal(history.swaps[0].newHash, v2);
@@ -401,7 +426,7 @@ test.provider(
         assert(forced.events.every((event) => event.hash === v3));
         assert(Date.now() - pendingAt >= Number(process.env.DRAIN_DEADLINE_MS) - 100);
         assert(Date.now() - pendingAt < Number(process.env.DRAIN_DEADLINE_MS) + 2000);
-        const deadlineLog = (await get<{ swaps: Swap[] }>("/u/" + a + "/swaps?limit=1")).swaps[0];
+        const deadlineLog = (await get<Status>("/u/" + a + "/__status?swaps=1")).swaps[0];
         assert.equal(deadlineLog.oldHash, v3);
         assert.equal(deadlineLog.newHash, v4);
         assert.equal(deadlineLog.kind, "code");
@@ -431,7 +456,7 @@ test.provider(
           newVersion: v4,
         });
         assert.equal((await note(a, "secret", "must not write")).status, 403);
-        const scopeLog = (await get<{ swaps: Swap[] }>("/u/" + a + "/swaps?limit=1")).swaps[0];
+        const scopeLog = (await get<Status>("/u/" + a + "/__status?swaps=1")).swaps[0];
         assert.equal(scopeLog.oldHash, v4);
         assert.equal(scopeLog.newHash, v4);
         assert.equal(scopeLog.kind, "scope");
