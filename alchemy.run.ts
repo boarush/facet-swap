@@ -14,7 +14,7 @@ export const bundleFacet = (version: string) =>
       input: "src/app.ts",
       platform: "neutral",
       external: ["cloudflare:workers"],
-      transform: { target: "es2022", define: { VERSION: JSON.stringify(version) } },
+      transform: { target: "es2024", define: { VERSION: JSON.stringify(version) } },
     },
     { format: "esm", codeSplitting: false },
   ).pipe(
