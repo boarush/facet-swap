@@ -81,7 +81,7 @@ export class Supervisor extends DurableObject<Env> {
     .put("/__scope", async (c) => {
       const body = await c.req.raw.json<{ readOnly?: unknown }>();
       if (typeof body.readOnly !== "boolean") return new Response("Invalid scope", { status: 400 });
-      const target = this.state.pending ?? this.state.current;
+      const target = this.target();
       if (!target) return new Response("Publish a version first", { status: 503 });
       // Same scope means same facet env; draining would only cost availability.
       if (target.readOnly === body.readOnly)
@@ -187,14 +187,20 @@ export class Supervisor extends DurableObject<Env> {
             this.state.pending?.generation ?? 0,
           );
           if (latest.generation <= highest) return;
-          const readOnly = (this.state.pending ?? this.state.current)?.readOnly ?? false;
-          await loadApp(this.env, latest.hash, { user: this.ctx.id.toString(), readOnly }, true);
+          const scope = {
+            user: this.ctx.id.toString(),
+            readOnly: this.target()?.readOnly ?? false,
+          };
+          await loadApp(this.env, latest.hash, scope, true);
+          // A scope change may land during preflight; never stage the stale permission.
+          // The module is already validated, so a new scope only needs a new loader env.
+          const readOnly = this.target()?.readOnly ?? false;
           config = { hash: latest.hash, generation: latest.generation, readOnly };
         } catch (error) {
           console.error("Facet preflight failed; keeping current configuration", latest, error);
           return;
         }
-        const target = this.state.pending ?? this.state.current;
+        const target = this.target();
         if (target?.hash === config.hash) {
           // A forced republication of identical code advances ordering, not the drain.
           target.generation = config.generation;
@@ -205,6 +211,11 @@ export class Supervisor extends DurableObject<Env> {
       }
       this.swapWhenIdle();
     });
+  }
+
+  // The configuration the next swap lands on.
+  private target(): AppConfig | null {
+    return this.state.pending ?? this.state.current;
   }
 
   private stage(config: AppConfig): void {

@@ -317,6 +317,42 @@ test("Hono control routes retain update-check ordering and do not reach the face
   assert.equal(h.ctx.facets.get.mock.calls.length, 0);
 });
 
+test("a scope change during code preflight is not overwritten", async () => {
+  const h = harness();
+  let sendBody!: (body: string) => void;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      sendBody = (text) => {
+        controller.enqueue(new TextEncoder().encode(text));
+        controller.close();
+      };
+    },
+  });
+  // The scope request passes its update check, then waits on its body.
+  const scope = h.supervisor.fetch(
+    new Request("http://local/__scope", { method: "PUT", body, duplex: "half" } as RequestInit),
+  );
+  await vi.waitFor(() => assert.equal(h.env.VERSIONS.get.mock.calls.length, 1));
+  // Let that check settle so the next request starts its own.
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  let finishPreflight!: () => void;
+  const preflightGate = new Promise<void>((resolve) => (finishPreflight = resolve));
+  h.env.CODE.get.mockImplementationOnce(async () => {
+    await preflightGate;
+    return { text: async () => "module" };
+  });
+  h.env.latest = hash(2);
+  const update = h.supervisor.fetch(new Request("http://local/version"));
+  await vi.waitFor(() => assert.equal(h.env.CODE.get.mock.calls.length, 1));
+  sendBody('{"readOnly":true}');
+  assert.equal((await scope).status, 200);
+  finishPreflight();
+  await update;
+  const { current, pending } = await h.status();
+  assert.equal((pending ?? current)!.hash, hash(2));
+  assert.equal((pending ?? current)!.readOnly, true);
+});
+
 test("unchanged scope is a no-op instead of a drain", async () => {
   const h = harness();
   const { readOnly } = (await h.status()).current!;
