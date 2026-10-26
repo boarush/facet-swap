@@ -608,7 +608,7 @@ test.provider(
           "real loader rejects malformed/missing/uncompilable code, retries missing code, ignores stale KV",
         );
 
-        // Ordering comes from persisted Action output even when the clock stalls/regresses.
+        // Ordering comes from KV latest even when the clock stalls/regresses.
         const clock = vi.spyOn(Date, "now").mockReturnValue(8_000_000_000_000_000);
         try {
           await deploy("generation-a", "g2");
@@ -623,7 +623,14 @@ test.provider(
           assert.equal(third.hash, first.hash);
           await deploy("generation-a", "g2");
           assert.deepEqual(await get<Publication>("/__local/publication"), third);
-          pass("generation increases with a stalled/regressing clock; unchanged deploy is a no-op");
+          // KV ahead of the Action's output, as after an interrupted publish.
+          await inject(third.hash!, third.generation + 100);
+          await deploy("generation-b", "g2");
+          const fourth = await get<Publication>("/__local/publication");
+          assert.equal(fourth.generation, third.generation + 101);
+          pass(
+            "generation increases with a stalled/regressing clock or lost Action output; unchanged deploy is a no-op",
+          );
         } finally {
           clock.mockRestore();
         }
