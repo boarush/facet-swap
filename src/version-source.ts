@@ -42,19 +42,22 @@ export async function loadApp(env: Env, hash: string, scope: NotesScope, preflig
   // Don't cache a failed R2 read in the loader: a later check must be able to retry.
   const code = preflight ? await readCode() : undefined;
   // Loader env is cached too: hash alone would share Alice's capabilities with Bob.
-  const worker = env.LOADER.get(JSON.stringify([hash, scope.user, scope.readOnly]), async () => {
-    return {
-      compatibilityDate: "2026-10-12",
-      mainModule: "app.js",
-      modules: { "app.js": code ?? (await readCode()) },
-      env: {
-        HASH: hash,
-        NOTES: exports.ScopedNotes({ props: scope }),
-        SCHEDULER: exports.Scheduler({ props: { user: scope.user } }),
-      },
-      globalOutbound: null,
-    };
-  });
+  const worker = env.LOADER.get(
+    JSON.stringify([hash, scope.supervisorId, scope.readOnly]),
+    async () => {
+      return {
+        compatibilityDate: "2026-10-12",
+        mainModule: "app.js",
+        modules: { "app.js": code ?? (await readCode()) },
+        env: {
+          HASH: hash,
+          NOTES: exports.ScopedNotes({ props: scope }),
+          SCHEDULER: exports.Scheduler({ props: { supervisorId: scope.supervisorId } }),
+        },
+        globalOutbound: null,
+      };
+    },
+  );
   if (preflight) {
     const response = await worker.getEntrypoint().fetch("https://facet.invalid/");
     if (response.status !== 204) throw new Error("Facet preflight failed: " + response.status);

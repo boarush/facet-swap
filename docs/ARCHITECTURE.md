@@ -33,7 +33,7 @@ flowchart TB
     S --- SD[(Supervisor SQLite: configs, alarms, swap log)]
     F --- FD[(Facet SQLite)]
   end
-  S -->|specialize loopback with user and permissions| N[ScopedNotes entrypoint in entry Worker]
+  S -->|specialize loopback with supervisorId and permissions| N[ScopedNotes entrypoint in entry Worker]
   N -->|GATEWAY service binding| G[Separate gateway Worker]
   F -->|NOTES RPC stub| N
   F -->|SCHEDULER RPC stub| A[Scheduler loopback entrypoint]
@@ -53,13 +53,13 @@ flowchart TB
 
 ## Capabilities Instead of Raw Bindings
 
-The gateway Worker owns the Notes R2 bucket and exports an unscoped `Notes` entrypoint with `get`, `put`, and a revision diagnostic. Its default HTTP handler always returns 404. Only the trusted entry Worker receives the unscoped `GATEWAY` service binding; the Supervisor's user identity comes from its Durable Object ID, never facet input.
+The gateway Worker owns the Notes R2 bucket and exports an unscoped `Notes` entrypoint with `get`, `put`, and a revision diagnostic. Its default HTTP handler always returns 404. Only the trusted entry Worker receives the unscoped `GATEWAY` service binding; the Supervisor's scope identity comes from its Durable Object ID, never facet input.
 
-The entry Worker exports a thin `ScopedNotes` entrypoint. The Supervisor specializes its loopback binding with immutable `{ user, readOnly }` props and passes the resulting service stub into the facet's loader env. `ScopedNotes` prefixes every key with that user ID, accepts only opaque alphanumeric/underscore/hyphen keys, and checks write permission. The facet can call `get(key)` and `put(key, value)`, but cannot choose another prefix, alter props, mint a new stub, or reach the unscoped gateway. `GET/PUT /u/<user>/notes?key=note` exercises these calls from inside the facet.
+The entry Worker exports a thin `ScopedNotes` entrypoint. The Supervisor specializes its loopback binding with immutable `{ supervisorId, readOnly }` props and passes the resulting service stub into the facet's loader env. `ScopedNotes` prefixes every key with that serialized Supervisor ID, accepts only opaque alphanumeric/underscore/hyphen keys, and checks write permission. The facet can call `get(key)` and `put(key, value)`, but cannot choose another prefix, alter props, mint a new stub, or reach the unscoped gateway. `GET/PUT /u/<user>/notes?key=note` exercises these calls from inside the facet.
 
 Cross-worker service bindings accept deployment-time props. Runtime specialization is available on [loopback bindings](https://developers.cloudflare.com/workers/runtime-apis/context/#specifying-ctxprops-when-using-ctxexports), so the Supervisor uses a same-worker forwarding entrypoint to create each scoped stub. The local integration test exercises props serialization into the loader environment.
 
-The loader cache key includes the code hash, user ID, and permission. Caching solely by hash would reuse another user's frozen env, a capability leak even if the underlying module bytes are identical.
+The loader cache key includes the code hash, serialized Supervisor ID, and permission. Caching solely by hash would reuse another user's frozen env, a capability leak even if the underlying module bytes are identical.
 
 ### Refreshing Scope
 

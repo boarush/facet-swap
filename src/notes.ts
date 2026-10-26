@@ -2,7 +2,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 
 import type { Env } from "../alchemy.run";
 
-export type NotesScope = { user: string; readOnly: boolean };
+export type NotesScope = { supervisorId: string; readOnly: boolean };
 
 // RPC keeps an error's message but not its class, so denials are tagged by prefix.
 export const DENIED = "Notes denied: ";
@@ -18,7 +18,7 @@ export class ScopedNotes extends WorkerEntrypoint<Env, NotesScope> {
     if (typeof key !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(key)) {
       throw new Error(DENIED + "invalid key");
     }
-    return this.ctx.props.user + "/" + key;
+    return this.ctx.props.supervisorId + "/" + key;
   }
 
   get(key: string): Promise<string | null> {

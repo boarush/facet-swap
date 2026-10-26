@@ -3,9 +3,9 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Env } from "../alchemy.run";
 
 // Same loopback specialization as Notes, but confined to this Supervisor's alarm.
-export class Scheduler extends WorkerEntrypoint<Env, { user: string }> {
+export class Scheduler extends WorkerEntrypoint<Env, { supervisorId: string }> {
   #supervisor() {
-    return this.env.SUPERVISORS.get(this.env.SUPERVISORS.idFromString(this.ctx.props.user));
+    return this.env.SUPERVISORS.get(this.env.SUPERVISORS.idFromString(this.ctx.props.supervisorId));
   }
 
   setAlarm(time: number | Date): Promise<void> {

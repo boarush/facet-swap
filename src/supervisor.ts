@@ -188,7 +188,7 @@ export class Supervisor extends DurableObject<Env> {
         );
         if (latest.generation <= highest) return;
         const scope = {
-          user: this.ctx.id.toString(),
+          supervisorId: this.ctx.id.toString(),
           readOnly: this.target()?.readOnly ?? false,
         };
         await loadApp(this.env, latest.hash, scope, true);
@@ -283,7 +283,7 @@ export class Supervisor extends DurableObject<Env> {
 
   private app() {
     const { hash, readOnly } = this.state.current!;
-    const scope = { user: this.ctx.id.toString(), readOnly };
+    const scope = { supervisorId: this.ctx.id.toString(), readOnly };
     return this.ctx.facets.get("app", () => loadApp(this.env, hash, scope));
   }
 
