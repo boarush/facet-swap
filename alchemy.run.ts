@@ -26,7 +26,8 @@ export const bundleFacet = (version: string) =>
       if (bundle.files.length !== 1 || typeof file.content !== "string") {
         throw new Error("A facet must be a single JavaScript module");
       }
-      // The loader verifies the module bytes, not Alchemy's aggregate bundle hash.
+      // Address the module bytes, not Alchemy's aggregate bundle hash. Supervisors trust
+      // code/<hash>.js as published here; integrity rests on the private bucket.
       return { code: file.content, hash: file.hash, version };
     }),
     Effect.orDie,

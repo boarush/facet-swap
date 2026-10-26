@@ -77,7 +77,7 @@ In Alchemy's local provider, a gateway-only revision change restarts Gateway whi
 
 `alchemy.run.ts` declares the local R2 bucket, KV namespace, Worker Loader binding, Supervisor namespace, and entry Worker. It defines and calls `bundleFacet` and `publishFacet` during stack evaluation.
 
-Alchemy's `Bundle.build` uses its rolldown helper to produce one ESM module from `src/app.ts`. The file's SHA-256 hash, not the aggregate bundle hash, addresses `code/<hash>.js`.
+Alchemy's `Bundle.build` uses its rolldown helper to produce one ESM module from `src/app.ts`. The file's SHA-256 hash, not the aggregate bundle hash, addresses `code/<hash>.js`. Supervisors do not re-hash what they load; content-address integrity relies on the bucket being private and written only by this stack.
 
 Publication uses two built-in, diffed Alchemy Actions. **FacetCode** takes only the content hash as its persisted, diffed input and writes the module through `WriteBucketLocal`. Module bytes come from the evaluation closure, so the bundle does not enter Action state. **FacetLatest** consumes the upload's successful hash output and writes `{ hash, generation }` to KV `latest`, with version and publication metadata, through `WriteNamespaceLocal`. This dependency prevents publication before the code object exists. Both write through Alchemy's local emulators.
 
