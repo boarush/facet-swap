@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
-import type { ScopedNotes } from "./notes";
+import { isDenied, type ScopedNotes } from "./notes";
 import { createRouter } from "./router";
 import type { Scheduler } from "./scheduler";
 
@@ -72,6 +72,8 @@ export class App extends DurableObject<AppEnv> {
           gateway: await c.env.NOTES.revision(),
         });
       } catch (error) {
+        // Only scope denials are 403; gateway or storage failures propagate as errors.
+        if (!isDenied(error)) throw error;
         return new Response(String(error), { status: 403 });
       }
     })

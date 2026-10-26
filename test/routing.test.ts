@@ -20,6 +20,7 @@ vi.mock("cloudflare:workers", () => ({
 const { default: worker } = await import("../src/worker");
 const { App } = await import("../src/app");
 const { createRouter } = await import("../src/router");
+const { DENIED } = await import("../src/notes");
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -166,6 +167,16 @@ test("facet routes retain method errors, validation, query decoding and exact 40
   assert.equal(stream.headers.get("content-type"), "text/event-stream");
   assert.equal(stream.headers.get("cache-control"), "no-cache");
   assert.match(await stream.text(), /^id: 1\ndata: /);
+});
+
+test("notes map scope denials to 403 and propagate gateway failures", async () => {
+  const h = facet();
+  h.env.NOTES.put.mockRejectedValueOnce(new Error(DENIED + "read-only"));
+  const denied = await h.fetch("/notes", { method: "PUT", body: "x" });
+  assert.equal(denied.status, 403);
+  const outage = new Error("gateway unavailable");
+  h.env.NOTES.get.mockRejectedValueOnce(outage);
+  await assert.rejects(h.fetch("/notes"), outage);
 });
 
 test("routing propagates unexpected errors and cancels discarded HEAD bodies", async () => {
