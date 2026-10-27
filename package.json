@@ -4,7 +4,7 @@
   "private": true,
   "description": "Local Alchemy Durable Object facet hot-swap prototype",
   "keywords": [],
-  "license": "ISC",
+  "license": "UNLICENSED",
   "author": "",
   "type": "module",
   "main": "index.js",
