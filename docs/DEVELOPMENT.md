@@ -49,3 +49,7 @@ npm run deploy
 Outside dev, the publish Actions write R2 and KV through the Cloudflare API with your CLI credentials. Routes, including `/u/<user>/__scope`, are unauthenticated.
 
 Keep both servers on loopback. Routes are unauthenticated; this is not a hardened multi-tenant sandbox. See [Architecture](ARCHITECTURE.md#limits-and-safety) for limits.
+
+## Changesets
+
+Record notable changes with `npx changeset`; `npx changeset version` applies them to the version and `CHANGELOG.md`.
