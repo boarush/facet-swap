@@ -25,14 +25,14 @@ Start the local stack, with update checks on every request.
 CHECK_INTERVAL_MS=0 npm run dev
 ```
 
-In another terminal, edit `src/app.ts` and run `npm run deploy`. Wait for Alchemy's **Done** message before querying the new version. Deploy requests reconciliation of the running dev stack, not a production deployment. Without dev running, it only records a trigger.
+In another terminal, edit `src/app.ts` and run `npm run dev:refresh`. Wait for Alchemy's **Done** message before querying the new version. It requests reconciliation of the running dev stack, not a production deployment. Without dev running, it only records a trigger.
 
 The CLI changes a nonce comment in `facet-version.ts` to trigger evaluation. The nonce does not change the module hash. Unchanged source and salt skip publication.
 
 ```sh
-npm run deploy               # preserve the current salt
-npm run deploy -- my-label   # set a salt
-npm run deploy -- ''         # clear the salt
+npm run dev:refresh             # preserve the current salt
+npm run dev:refresh -- my-label # set a salt
+npm run dev:refresh -- ''       # clear the salt
 ```
 
 A different salt changes the hash without a source edit; reusing the same salt does not force publication. Starting dev also evaluates the current source and salt.
@@ -43,7 +43,7 @@ A different salt changes the hash without a source edit; reusing the same salt d
 
 ```sh
 npx alchemy profile edit --add Cloudflare
-npx alchemy deploy --stage prod
+npm run deploy
 ```
 
 Outside dev, the publish Actions write R2 and KV through the Cloudflare API with your CLI credentials. Routes, including `/u/<user>/__scope`, are unauthenticated.

@@ -87,7 +87,7 @@ Each stack evaluation bundles the source to discover changes. Identical module b
 
 ```mermaid
 flowchart TD
-  CLI["npm run deploy"] --> TRIGGER[Change stack reconciliation trigger]
+  CLI["npm run dev:refresh"] --> TRIGGER[Change stack reconciliation trigger]
   SALT["Optional argument or edit to facet-version.ts"] --> LABEL[Set manual salt]
   LABEL --> EVAL[Alchemy dev reconciles stack]
   TRIGGER --> EVAL

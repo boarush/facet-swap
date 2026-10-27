@@ -28,11 +28,11 @@ CHECK_INTERVAL_MS=0 npm run dev
 In another terminal, reconcile the current source, wait for Alchemy's Done message, and open a stream.
 
 ```sh
-npm run deploy
+npm run dev:refresh
 curl -N 'http://127.0.0.1:18743/u/alice/stream?n=20&ms=500'
 ```
 
-While it runs, edit `src/app.ts` and run `npm run deploy` again. See [Development](docs/DEVELOPMENT.md#local-execution) for label-only updates and deploy behavior.
+While it runs, edit `src/app.ts` and run `npm run dev:refresh` again. See [Development](docs/DEVELOPMENT.md#local-execution) for label-only updates and deploy behavior.
 
 After Done, request `/u/alice/version`. During the drain it returns 503 with retry and current/pending hash headers. Wait at least one second plus jitter and retry. Once the stream finishes or the deadline cuts it, the response shows the new hash and the preserved served counter. A cut SSE stream ends with a best-effort `update-abort` event. Bob's requests are unaffected by Alice's drain.
 

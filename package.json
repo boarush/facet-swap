@@ -10,8 +10,9 @@
   "main": "index.js",
   "scripts": {
     "check": "tsc --noEmit",
-    "deploy": "node scripts/deploy.ts",
+    "deploy": "alchemy deploy --stage prod",
     "dev": "alchemy dev --no-input",
+    "dev:refresh": "node scripts/deploy.ts",
     "fmt": "oxfmt --write .",
     "fmt:check": "oxfmt --check .",
     "lint": "oxlint --deny-warnings .",
