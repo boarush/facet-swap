@@ -11,6 +11,7 @@ npm run lint          # lint
 npm run fmt           # format
 npm run fmt:check     # check formatting
 npm test              # run tests
+npm run test:quick    # skip the stack test while iterating
 ```
 
 Runtime imports from the stack must be type-only. Runtime and stack code must not import scripts or tests.

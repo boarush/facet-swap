@@ -17,7 +17,8 @@
     "fmt:check": "oxfmt --check .",
     "lint": "oxlint --deny-warnings .",
     "prepare": "effect-tsgo patch --typescript --oxlint",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:quick": "vitest run --exclude test/facet.test.ts"
   },
   "dependencies": {
     "@alchemy.run/cloudflare": "2.0.0-beta.84",
