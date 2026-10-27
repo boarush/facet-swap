@@ -51,12 +51,14 @@ function facet() {
   const data = new Map<string, unknown>();
   const env = {
     HASH: "1234567890abcdef",
-    NOTES: {
+  };
+  const props = {
+    notes: {
       get: vi.fn<(key: string) => Promise<string>>(async (key) => key),
       put: vi.fn<(key: string, value: string) => Promise<void>>(async () => {}),
       revision: async () => "g1",
     },
-    SCHEDULER: {
+    scheduler: {
       getAlarm: async () => null,
       setAlarm: vi.fn<(time: number | Date) => Promise<void>>(async () => {}),
       deleteAlarm: vi.fn<() => Promise<void>>(async () => {}),
@@ -65,6 +67,7 @@ function facet() {
   const app = new App(
     // The unit harness implements only the storage and RPC surface exercised here.
     {
+      props,
       storage: {
         kv: {
           get: (key: string) => data.get(key),
@@ -75,7 +78,7 @@ function facet() {
     env as unknown as ConstructorParameters<typeof App>[1],
   );
   return {
-    env,
+    props,
     data,
     fetch: (path: string, init?: RequestInit) =>
       app.fetch(new Request("http://local" + path, init)),
@@ -170,11 +173,11 @@ test("facet routes retain method errors, validation, query decoding and exact 40
 
 test("notes map scope denials to 403 and propagate gateway failures", async () => {
   const h = facet();
-  h.env.NOTES.put.mockRejectedValueOnce(new Error(DENIED + "read-only"));
+  h.props.notes.put.mockRejectedValueOnce(new Error(DENIED + "read-only"));
   const denied = await h.fetch("/notes", { method: "PUT", body: "x" });
   assert.equal(denied.status, 403);
   const outage = new Error("gateway unavailable");
-  h.env.NOTES.get.mockRejectedValueOnce(outage);
+  h.props.notes.get.mockRejectedValueOnce(outage);
   await assert.rejects(h.fetch("/notes"), outage);
 });
 
@@ -197,7 +200,7 @@ test("routing propagates unexpected errors and cancels discarded HEAD bodies", a
   assert.equal(cancelled.mock.calls.length, 1);
   await assert.rejects(async () => app.request("/error"), /not swallowed/);
   const h = facet();
-  h.env.SCHEDULER.setAlarm.mockRejectedValueOnce(new Error("scheduler unavailable"));
+  h.props.scheduler.setAlarm.mockRejectedValueOnce(new Error("scheduler unavailable"));
   await assert.rejects(
     h.fetch("/alarm", { method: "PUT", body: '{"time":123}' }),
     /scheduler unavailable/,

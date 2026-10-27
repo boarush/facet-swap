@@ -8,11 +8,14 @@ declare const VERSION: string;
 
 type AppEnv = {
   HASH: string;
-  NOTES: Service<ScopedNotes>;
-  SCHEDULER: Service<Scheduler>;
 };
 
-export class App extends DurableObject<AppEnv> {
+type AppProps = {
+  notes: Service<ScopedNotes>;
+  scheduler: Service<Scheduler>;
+};
+
+export class App extends DurableObject<AppEnv, AppProps> {
   // Native event names cannot be invoked through a DurableObject RPC stub.
   dispatchAlarm(info?: AlarmInvocationInfo): Promise<void> {
     return this.alarm(info);
@@ -20,7 +23,7 @@ export class App extends DurableObject<AppEnv> {
 
   async alarm(_info?: AlarmInvocationInfo): Promise<void> {
     // RPC before any write, so a failed call leaves nothing behind for the retry to double.
-    const scheduled = await this.env.SCHEDULER.getAlarm();
+    const scheduled = await this.ctx.props.scheduler.getAlarm();
     this.ctx.storage.transactionSync(() => {
       const count = this.ctx.storage.kv.get<number>("alarms") ?? 0;
       this.ctx.storage.kv.put("alarms", count + 1);
@@ -45,14 +48,14 @@ export class App extends DurableObject<AppEnv> {
         if (!Number.isSafeInteger(time) || time <= 0) {
           return new Response("Invalid alarm time", { status: 400 });
         }
-        await c.env.SCHEDULER.setAlarm(time);
+        await this.ctx.props.scheduler.setAlarm(time);
       } else if (request.method === "DELETE") {
-        await c.env.SCHEDULER.deleteAlarm();
+        await this.ctx.props.scheduler.deleteAlarm();
       } else if (request.method !== "GET") {
         return new Response("Method not allowed", { status: 405 });
       }
       return Response.json({
-        scheduled: await c.env.SCHEDULER.getAlarm(),
+        scheduled: await this.ctx.props.scheduler.getAlarm(),
         count: this.ctx.storage.kv.get<number>("alarms") ?? 0,
         last: this.ctx.storage.kv.get("last-alarm") ?? null,
       });
@@ -63,13 +66,13 @@ export class App extends DurableObject<AppEnv> {
       const key = new URL(c.req.url).searchParams.get("key") ?? "note";
       try {
         if (c.req.method === "PUT") {
-          await c.env.NOTES.put(key, await c.req.raw.text());
+          await this.ctx.props.notes.put(key, await c.req.raw.text());
         } else if (c.req.method !== "GET") {
           return new Response("Method not allowed", { status: 405 });
         }
         return Response.json({
-          value: await c.env.NOTES.get(key),
-          gateway: await c.env.NOTES.revision(),
+          value: await this.ctx.props.notes.get(key),
+          gateway: await this.ctx.props.notes.revision(),
         });
       } catch (error) {
         // Only scope denials are 403; gateway or storage failures propagate as errors.

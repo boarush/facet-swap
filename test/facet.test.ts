@@ -322,6 +322,9 @@ test.provider(
         assert.equal(afterCancel.hash, v3);
         assert.equal(afterCancel.served, 3);
         pass("client cancellation releases inflight, allows pending v3 swap, preserves SQLite");
+        // Both facets share one loader hash, but their props carry distinct capabilities.
+        assert.equal((await get("/u/" + a + "/version")).hash, v3);
+        assert.equal((await get("/u/" + b + "/version")).hash, v3);
         // These calls run inside F and cross two real service-binding boundaries.
         const note = async (user: string, key: string, value?: string) => {
           const response = await fetch(
@@ -466,6 +469,12 @@ test.provider(
           assert.equal((await response.json<{ scheduled: number | null }>()).scheduled, time);
         };
         assert.deepEqual(await get<Alarm>(alarmPath), { scheduled: null, count: 0, last: null });
+        const otherAlarmPath = "/u/" + b + "/alarm";
+        const isolatedAt = Date.now() + 60000;
+        await schedule(isolatedAt);
+        assert.equal((await get<Alarm>(otherAlarmPath)).scheduled, null);
+        await fetch(base + otherAlarmPath, { method: "DELETE" });
+        assert.equal((await get<Alarm>(alarmPath)).scheduled, isolatedAt);
         const cancelledAt = Date.now() + 300;
         await schedule(cancelledAt);
         const deleted = await fetch(base + alarmPath, { method: "DELETE" });

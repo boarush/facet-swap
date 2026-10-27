@@ -20,7 +20,7 @@ SSE handlers return raw response bodies. The shared router cancels discarded HEA
 
 The **Supervisor** has stable code. It handles admission, tracks response lifetimes, and persists the current and pending configurations in its own SQLite-backed storage.
 
-The **Facet** contains the application logic. Worker Loader loads its module by content hash from R2. The facet has a separate SQLite database, preserved when the Supervisor aborts and recreates it. An optional manual label is compiled into the module as a salt; no label is needed for publication. Its hash is passed as `env.HASH`, avoiding a self-referential hash. Both `/version` and SSE events show a 12-character hash in `v`, the full `hash`, and a `label` only when one is set. It receives scoped `env.NOTES` and `env.SCHEDULER` service stubs, not raw resource bindings.
+The **Facet** contains the application logic. Worker Loader loads its module by content hash from R2. The facet has a separate SQLite database, preserved when the Supervisor aborts and recreates it. An optional manual label is compiled into the module as a salt; no label is needed for publication. Its hash is passed as `env.HASH`, avoiding a self-referential hash. Both `/version` and SSE events show a 12-character hash in `v`, the full `hash`, and a `label` only when one is set. It receives scoped Notes and scheduler service stubs through `ctx.props`, not raw resource bindings.
 
 ### Architecture
 
@@ -35,8 +35,8 @@ flowchart TB
   end
   S -->|specialize loopback with supervisorId and permissions| N[ScopedNotes entrypoint in entry Worker]
   N -->|GATEWAY service binding| G[Separate gateway Worker]
-  F -->|NOTES RPC stub| N
-  F -->|SCHEDULER RPC stub| A[Scheduler loopback entrypoint]
+  F -->|notes props stub| N
+  F -->|scheduler props stub| A[Scheduler loopback entrypoint]
   A -->|fixed Supervisor identity| S
   S -.->|native alarm invokes facet handler| F
   G -->|owns raw binding| NOTES[(R2 notes)]
@@ -55,11 +55,11 @@ flowchart TB
 
 The gateway Worker owns the Notes R2 bucket and exports an unscoped `Notes` entrypoint with `get`, `put`, and a revision diagnostic. Its default HTTP handler always returns 404. Only the trusted entry Worker receives the unscoped `GATEWAY` service binding; the Supervisor's scope identity comes from its Durable Object ID, never facet input.
 
-The entry Worker exports a thin `ScopedNotes` entrypoint. The Supervisor specializes its loopback binding with immutable `{ supervisorId, readOnly }` props and passes the resulting service stub into the facet's loader env. `ScopedNotes` prefixes every key with that serialized Supervisor ID, accepts only opaque alphanumeric/underscore/hyphen keys, and checks write permission. The facet can call `get(key)` and `put(key, value)`, but cannot choose another prefix, alter props, mint a new stub, or reach the unscoped gateway. `GET/PUT /u/<user>/notes?key=note` exercises these calls from inside the facet.
+The entry Worker exports a thin `ScopedNotes` entrypoint. The Supervisor specializes its loopback binding with immutable `{ supervisorId, readOnly }` props and passes the resulting service stub into the facet's class props. `ScopedNotes` prefixes every key with that serialized Supervisor ID, accepts only opaque alphanumeric/underscore/hyphen keys, and checks write permission. The facet can call `get(key)` and `put(key, value)`, but cannot choose another prefix, alter props, mint a new stub, or reach the unscoped gateway. `GET/PUT /u/<user>/notes?key=note` exercises these calls from inside the facet.
 
-Cross-worker service bindings accept deployment-time props. Runtime specialization is available on [loopback bindings](https://developers.cloudflare.com/workers/runtime-apis/context/#specifying-ctxprops-when-using-ctxexports), so the Supervisor uses a same-worker forwarding entrypoint to create each scoped stub. The local integration test exercises props serialization into the loader environment.
+Cross-worker service bindings accept deployment-time props. Runtime specialization is available on [loopback bindings](https://developers.cloudflare.com/workers/runtime-apis/context/#specifying-ctxprops-when-using-ctxexports), so the Supervisor uses a same-worker forwarding entrypoint to create each scoped stub. The local integration test exercises service stub serialization into Durable Object class props, per-user Notes and alarm isolation, and permission refresh after abort.
 
-The loader cache key includes the code hash, serialized Supervisor ID, and permission. Caching solely by hash would reuse another user's frozen env, a capability leak even if the underlying module bytes are identical.
+The loader cache key is the code hash, and its shared environment contains only `HASH`. Each facet gets its own scoped service stubs through `getDurableObjectClass("App", { props: { notes, scheduler } })`. User capabilities never enter the shared loader environment.
 
 ### Refreshing Scope
 
@@ -187,7 +187,7 @@ sequenceDiagram
 
 ## Alarms Through the Supervisor
 
-Facets cannot own native alarms. The Supervisor supplies `env.SCHEDULER`, a loopback service stub with `setAlarm(time: number | Date)`, `getAlarm()`, and `deleteAlarm()`. Like Notes, its immutable props fix the Supervisor identity; the facet cannot select another object or obtain its raw namespace/stub. There is one logical alarm per Supervisor. Setting another time replaces it, and deleting cancels it.
+Facets cannot own native alarms. The Supervisor supplies `ctx.props.scheduler`, a loopback service stub with `setAlarm(time: number | Date)`, `getAlarm()`, and `deleteAlarm()`. Like Notes, its immutable props fix the Supervisor identity; the facet cannot select another object or obtain its raw namespace/stub. There is one logical alarm per Supervisor. Setting another time replaces it, and deleting cancels it.
 
 The due time and a unique scheduling token live in the Supervisor's SQLite-backed storage. Setting/deleting that record and the native storage alarm share a transaction. Neither a code/scope swap nor Supervisor reconstruction resets the schedule. `getAlarm()` reports the logical due time, even when the physical alarm was postponed for draining; while that delivery is executing it returns null unless the handler has scheduled a replacement. Tokens keep a handler's rearm safe even when it uses the same timestamp.
 
@@ -211,7 +211,7 @@ There is no rollback or canary path. A faulty release is corrected by publishing
 
 ## Limits and Safety
 
-Keep both runtime servers on loopback and do not tunnel them. Only trusted local code should publish facets. The dynamic worker receives only its hash and scoped Notes/scheduler service stubs, no raw R2, KV, or namespace bindings, and has `globalOutbound = null`. These restrictions do not make this prototype a hardened multi-tenant sandbox.
+Keep both runtime servers on loopback and do not tunnel them. Only trusted local code should publish facets. The dynamic worker environment contains only its hash; each facet receives scoped Notes/scheduler service stubs through class props. Neither receives raw R2, KV, or namespace bindings, and the worker has `globalOutbound = null`. These restrictions do not make this prototype a hardened multi-tenant sandbox.
 
 Actions diff inputs rather than checking for storage drift. Deleting emulator data independently of Alchemy state requires a forced reconciliation. Old R2 code objects are retained for Supervisors that have not updated.
 

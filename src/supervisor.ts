@@ -83,7 +83,7 @@ export class Supervisor extends DurableObject<Env> {
       if (typeof body.readOnly !== "boolean") return new Response("Invalid scope", { status: 400 });
       const target = this.target();
       if (!target) return new Response("Publish a version first", { status: 503 });
-      // Same scope means same facet env; draining would only cost availability.
+      // Same scope means same facet props; draining would only cost availability.
       if (target.readOnly === body.readOnly)
         return Response.json({ accepted: true, changed: false });
       this.stage({ ...target, readOnly: body.readOnly });
@@ -193,7 +193,7 @@ export class Supervisor extends DurableObject<Env> {
         };
         await loadApp(this.env, latest.hash, scope, true);
         // A scope change may land during preflight; never stage the stale permission.
-        // The module is already validated, so a new scope only needs a new loader env.
+        // The module is already validated, so the facet receives its current scope through props.
         const readOnly = this.target()?.readOnly ?? false;
         config = { hash: latest.hash, generation: latest.generation, readOnly };
       } catch (error) {

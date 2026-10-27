@@ -10,7 +10,7 @@ export const isDenied = (error: unknown) =>
   error instanceof Error && error.message.startsWith(DENIED);
 
 // Cross-worker service bindings cannot receive caller-selected runtime props.
-// A specialized loopback binding can, and remains serializable in loader env.
+// A specialized loopback binding can, and remains serializable in facet props.
 // Keep enforcement here; never give the facet GATEWAY or a factory for new scopes.
 export class ScopedNotes extends WorkerEntrypoint<Env, NotesScope> {
   private key(key: string): string {
