@@ -94,8 +94,6 @@ export const gatewayWorker = (gatewayRevision = "g1") =>
 
 export const resources = (label = version, gatewayRevision = "g1") =>
   Effect.gen(function* () {
-    if (!(yield* Alchemy.AlchemyContext).dev) throw new Error("Local-only. Use npm run dev.");
-
     const code = yield* Cloudflare.R2.Bucket("Code");
     const versions = yield* Cloudflare.KV.Namespace("Versions");
 

@@ -39,4 +39,13 @@ A different salt changes the hash without a source edit; reusing the same salt d
 
 `DRAIN_DEADLINE_MS` sets the drain deadline; `CHECK_INTERVAL_MS` sets the update-check interval. Zero means an immediate deadline or a check on every request, respectively. `PORT` sets the local port.
 
+## Deploy to Cloudflare
+
+```sh
+npx alchemy profile edit --add Cloudflare
+npx alchemy deploy --stage prod
+```
+
+Outside dev, the publish Actions write R2 and KV through the Cloudflare API with your CLI credentials. Routes, including `/u/<user>/__scope`, are unauthenticated.
+
 Keep both servers on loopback. Routes are unauthenticated; this is not a hardened multi-tenant sandbox. See [Architecture](ARCHITECTURE.md#limits-and-safety) for limits.
