@@ -22,16 +22,16 @@
   },
   "dependencies": {
     "@alchemy.run/cloudflare": "2.0.0-beta.84",
-    "@effect/platform-node": "^4.0.5",
+    "@effect/platform-node": "4.0.7",
     "alchemy": "2.0.0-beta.84",
-    "effect": "^4.0.5",
+    "effect": "4.0.7",
     "hono": "^4.13.13"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.3",
     "@cloudflare/workers-types": "5.20261012.1",
     "@effect/tsgo": "0.53.5",
-    "@effect/vitest": "^4.0.5",
+    "@effect/vitest": "4.0.7",
     "oxfmt": "^0.74.0",
     "oxlint": "1.88.0",
     "oxlint-tsgolint": "7.0.2004",
