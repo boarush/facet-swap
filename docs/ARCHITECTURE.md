@@ -187,7 +187,7 @@ sequenceDiagram
 
 ## Alarms Through the Supervisor
 
-Facets cannot own native alarms. The Supervisor supplies `ctx.props.scheduler`, a loopback service stub with `setAlarm(time: number | Date)`, `getAlarm()`, and `deleteAlarm()`. Like Notes, its immutable props fix the Supervisor identity; the facet cannot select another object or obtain its raw namespace/stub. There is one logical alarm per Supervisor. Setting another time replaces it, and deleting cancels it.
+Facets cannot own native alarms. The Supervisor supplies `ctx.props.scheduler`, a loopback service stub with `setAlarm(time: number | Date)`, `getAlarm()`, and `deleteAlarm()`. Like Notes, its immutable props fix the Supervisor identity; the facet cannot select another object or obtain its raw namespace/stub. There is one logical wake-up per Supervisor. The facet’s typed queue multiplexes application timers onto it.
 
 The due time and a unique scheduling token live in the Supervisor's SQLite-backed storage. Setting/deleting that record and the native storage alarm share a transaction. Neither a code/scope swap nor Supervisor reconstruction resets the schedule. `getAlarm()` reports the logical due time, even when the physical alarm was postponed for draining; while that delivery is executing it returns null unless the handler has scheduled a replacement. Tokens keep a handler's rearm safe even when it uses the same timestamp.
 
@@ -195,15 +195,17 @@ When the native `Supervisor.alarm()` fires, it performs the usual interval-limit
 
 Cloudflare reserves `alarm` on Durable Object RPC stubs. A tiny `F.dispatchAlarm(info)` bridge therefore invokes `F.alarm(info)`. The Supervisor copies the runtime's non-serializable invocation metadata into a plain object, preserving the logical scheduled time and native retry information.
 
-Errors propagate to the native alarm handler, using [Cloudflare's at-least-once retries](https://developers.cloudflare.com/durable-objects/api/alarms/) rather than a custom retry loop. Handlers **must be idempotent**: aborts or failures can repeat effects that already completed. Native retries use exponential backoff starting at two seconds, with up to six retries for the most recent `setAlarm`; this is not unlimited delivery. A logical record can remain after retry exhaustion and needs explicit rearming. Rearming/deleting during a handler follows native replacement/cancellation semantics; cancellation does not undo running work.
+The facet's `Alarms` module stores typed JSON entries in SQLite, indexed by time. Scheduling and cancellation rearm the Supervisor for the earliest entry, or delete its wake-up when empty. Due entries run in time and insertion order. Successful entries are deleted; failures, including unknown types, retry independently with exponential backoff starting at one second and capped at one hour. After ten failed attempts an entry is dropped with an error log. Handlers may schedule more work; newly scheduled entries run on a subsequent wake-up.
 
-The demo's `GET/PUT/DELETE /u/<user>/alarm` calls the scheduler from inside the facet. PUT accepts JSON `{"time": <epoch milliseconds>}`. GET reports `scheduled`, the facet's persistent firing `count`, and `last` with the handling code hash. The handler awaits `getAlarm()` before atomically writing its counter and last-delivery record, avoiding partial writes if that RPC fails.
+Delivery is at least once. Handlers must be idempotent because aborts and failures can repeat completed effects. Queue infrastructure errors propagate to Cloudflare's native retries; handler failures use the facet queue's retry schedule. Cancellation does not undo running work.
+
+The demo's `GET/PUT/DELETE /u/<user>/alarm` exposes the queue. PUT accepts `{type,time,payload}` and returns `{id}`; types are `reminder` with `{text}` and `cleanup` with `{key}`. DELETE accepts `?id=`. GET returns `alarms`, persistent delivery `count`, and `last` with the handling code hash, type, and payload.
 
 ## State and Forward-Only Changes
 
 Current and pending code/scope configurations are durable; active requests and the timer are not. There is no waiting-request queue. Persisting current before abort lets a restarted Supervisor select the intended code. A pending configuration recovered on wake is committed immediately because there is no recoverable inflight set to drain. A Supervisor crash can still lose open streams without a final abort event. Retry scheduling belongs to clients, not Supervisor memory.
 
-The application alarm schedule belongs to Supervisor storage; handler effects belong to the facet. Application state belongs in the facet's SQLite database. The demo writes a served counter before starting each stream, once per stream rather than once per event. The counter survives code replacement.
+The typed alarm queue and handler effects belong to facet storage; the Supervisor stores only the next wake-up. Application state belongs in the facet's SQLite database. The demo writes a served counter before starting each stream, once per stream rather than once per event. The counter survives code replacement.
 
 For a real long-running application, the **facet itself** must checkpoint meaningful work periodically. The Supervisor does not provide automatic checkpoints. This demo persists its counter, but does not implement resumable stream checkpoints or a migration framework. Application migrations should be repeatable and compatible with forward-only updates.
 

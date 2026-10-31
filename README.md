@@ -14,6 +14,7 @@ The [architecture guide](docs/ARCHITECTURE.md) covers capabilities, publication,
 `facet-version.ts` holds an optional label salt and the deploy reconciliation nonce.
 `scripts/deploy.ts` triggers stack evaluation; `test/` holds integration and regression tests.
 `docs/ARCHITECTURE.md` describes runtime and deployment boundaries; `docs/DEVELOPMENT.md` covers development.
+`rfcs/` tracks design proposals and their status.
 
 Install dependencies using the [development guide](docs/DEVELOPMENT.md). The local stack needs no Cloudflare credentials.
 

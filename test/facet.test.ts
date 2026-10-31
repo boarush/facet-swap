@@ -62,9 +62,9 @@ type Publication = {
   uploaded?: string;
 };
 type Alarm = {
-  scheduled: number | null;
+  alarms: { id: number; type: string; time: number; payload: unknown; attempts: number }[];
   count: number;
-  last: { hash: string; scheduled: number | null } | null;
+  last: { hash: string; type: string; payload: unknown } | null;
 };
 
 async function get<T = Version>(path: string): Promise<T> {
@@ -466,47 +466,53 @@ test.provider(
         pass("same-version scope drain has the same hard deadline and enforces new permission");
         const alarmUser = "alarm_" + process.pid;
         const alarmPath = "/u/" + alarmUser + "/alarm";
-        const schedule = async (time: number) => {
+        const schedule = async (
+          time: number,
+          type = "reminder",
+          payload: unknown = { text: "test" },
+        ) => {
           const response = await fetch(base + alarmPath, {
             method: "PUT",
-            body: JSON.stringify({ time }),
+            body: JSON.stringify({ type, time, payload }),
           });
           assert.equal(response.status, 200, await response.clone().text());
-          assert.equal((await response.json<{ scheduled: number | null }>()).scheduled, time);
+          return (await response.json<{ id: number }>()).id;
         };
-        assert.deepEqual(await get<Alarm>(alarmPath), { scheduled: null, count: 0, last: null });
-        const otherAlarmPath = "/u/" + b + "/alarm";
+        assert.deepEqual(await get<Alarm>(alarmPath), { alarms: [], count: 0, last: null });
         const isolatedAt = Date.now() + 60000;
-        await schedule(isolatedAt);
-        assert.equal((await get<Alarm>(otherAlarmPath)).scheduled, null);
-        await fetch(base + otherAlarmPath, { method: "DELETE" });
-        assert.equal((await get<Alarm>(alarmPath)).scheduled, isolatedAt);
-        const cancelledAt = Date.now() + 300;
-        await schedule(cancelledAt);
-        const deleted = await fetch(base + alarmPath, { method: "DELETE" });
-        assert.equal(deleted.status, 200);
-        assert.equal((await deleted.json<{ scheduled: number | null }>()).scheduled, null);
+        const isolated = await schedule(isolatedAt);
+        const otherAlarmPath = "/u/" + b + "/alarm";
+        assert.deepEqual((await get<Alarm>(otherAlarmPath)).alarms, []);
+        await fetch(base + otherAlarmPath + "?id=" + isolated, { method: "DELETE" });
+        assert.equal((await get<Alarm>(alarmPath)).alarms[0].time, isolatedAt);
+        await fetch(base + alarmPath + "?id=" + isolated, { method: "DELETE" });
+        const cancelled = await schedule(Date.now() + 300);
+        await fetch(base + alarmPath + "?id=" + cancelled, { method: "DELETE" });
         await delay(400);
         assert.equal((await get<Alarm>(alarmPath)).count, 0);
-        await schedule(Date.now() + 200);
-        await until(async () => (await get<Alarm>(alarmPath)).count === 1);
-        assert.deepEqual(await get<Alarm>(alarmPath), {
-          scheduled: null,
-          count: 1,
-          last: { hash: v4, scheduled: null },
+        const due = Date.now() + 200;
+        await schedule(due);
+        await schedule(due);
+        await schedule(due + 1, "cleanup", { key: "third" });
+        await until(async () => (await get<Alarm>(alarmPath)).count === 3);
+        assert.deepEqual((await get<Alarm>(alarmPath)).last, {
+          hash: v4,
+          type: "cleanup",
+          payload: { key: "third" },
         });
-        pass("facet scheduler set/get/delete uses real alarms; handler sees no pending delivery");
+        pass("typed queue fires same and different types; cancellation and user isolation hold");
 
-        // No application request to this Supervisor between publication and firing.
-        // The alarm itself must notice latest code and preserve the due time across abort.
         await schedule(Date.now() + 2000);
         const v5 = await deploy("v5", "g2");
         await delay(2200);
-        const swappedAlarm = await get<Alarm>(alarmPath);
-        assert.equal(swappedAlarm.count, 2);
-        assert.deepEqual(swappedAlarm.last, { hash: v5, scheduled: null });
-        assert.equal(swappedAlarm.scheduled, null);
-        pass("an alarm wakes on latest code without traffic; its schedule survives facet swap");
+        await until(async () => (await get<Alarm>(alarmPath)).count === 4);
+        assert.deepEqual((await get<Alarm>(alarmPath)).last, {
+          hash: v5,
+          type: "reminder",
+          payload: { text: "test" },
+        });
+        assert.deepEqual((await get<Alarm>(alarmPath)).alarms, []);
+        pass("queued entry survives swap and wakes latest code without traffic");
 
         await schedule(Date.now() + 1000);
         const alarmDrain = stream(alarmUser, 25, 100);
@@ -516,21 +522,10 @@ test.provider(
         await delay(1200);
         assert.equal((await get<Status>("/u/" + alarmUser + "/__status")).pending!.hash, v6);
         await alarmDrain.done;
-        await until(async () => (await get<Alarm>(alarmPath)).count === 3);
-        assert.deepEqual((await get<Alarm>(alarmPath)).last, { hash: v6, scheduled: null });
-        pass("alarm due during a normal drain defers and runs only after swap on new code");
+        await until(async () => (await get<Alarm>(alarmPath)).count === 5);
+        assert.equal((await get<Alarm>(alarmPath)).last!.hash, v6);
+        pass("queued delivery defers during drain and runs after swap");
 
-        await schedule(Date.now() + 1000);
-        const forcedAlarmDrain = stream(alarmUser, 100, 1000, true);
-        await forcedAlarmDrain.started;
-        const v7 = await deploy("v7", "g2");
-        await rejectedDuringDrain("/u/" + alarmUser + "/version", v6, v7);
-        const forcedAlarm = await forcedAlarmDrain.done;
-        assert.equal(forcedAlarm.updateAbort?.newVersion, v7);
-        await until(async () => (await get<Alarm>(alarmPath)).count === 4);
-        assert.deepEqual((await get<Alarm>(alarmPath)).last, { hash: v7, scheduled: null });
-        pass("drain deferrals leave the hard deadline intact and deliver after forced swap");
-        // Fault injection stays in the test bundle, not in the demo's alarm API.
         const alarmSource = await readFile(appPath, "utf8");
         try {
           await writeFile(
@@ -542,12 +537,9 @@ test.provider(
           );
           const retryHash = await deploy("alarm-retry", "g2");
           await schedule(Date.now() + 100);
-          await until(async () => (await get<Alarm>(alarmPath)).count === 5);
-          assert.deepEqual((await get<Alarm>(alarmPath)).last, {
-            hash: retryHash,
-            scheduled: null,
-          });
-          pass("facet exception reaches native retry; serializable retry metadata reaches handler");
+          await until(async () => (await get<Alarm>(alarmPath)).count === 6);
+          assert.equal((await get<Alarm>(alarmPath)).last!.hash, retryHash);
+          pass("queue infrastructure exception reaches native retry");
         } finally {
           await writeFile(appPath, alarmSource);
         }

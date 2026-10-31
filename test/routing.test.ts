@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 
 import { afterEach, test, vi } from "vitest";
 
@@ -64,11 +65,23 @@ function facet() {
       deleteAlarm: vi.fn<() => Promise<void>>(async () => {}),
     },
   };
+  const db = new DatabaseSync(":memory:");
   const app = new App(
     // The unit harness implements only the storage and RPC surface exercised here.
     {
       props,
       storage: {
+        sql: {
+          exec: (query: string, ...bindings: (string | number | null)[]) => {
+            if (!bindings.length && query.includes("CREATE TABLE")) {
+              db.exec(query);
+              return;
+            }
+            const rows = db.prepare(query).all(...bindings);
+            return { toArray: () => rows, one: () => rows[0] };
+          },
+        },
+        transactionSync: (fn: () => unknown) => fn(),
         kv: {
           get: (key: string) => data.get(key),
           put: (key: string, value: unknown) => data.set(key, value),
@@ -80,6 +93,7 @@ function facet() {
   return {
     props,
     data,
+    app,
     fetch: (path: string, init?: RequestInit) =>
       app.fetch(new Request("http://local" + path, init)),
   };
@@ -202,7 +216,105 @@ test("routing propagates unexpected errors and cancels discarded HEAD bodies", a
   const h = facet();
   h.props.scheduler.setAlarm.mockRejectedValueOnce(new Error("scheduler unavailable"));
   await assert.rejects(
-    h.fetch("/alarm", { method: "PUT", body: '{"time":123}' }),
+    h.fetch("/alarm", {
+      method: "PUT",
+      body: '{"type":"reminder","time":123,"payload":{"text":"test"}}',
+    }),
     /scheduler unavailable/,
   );
+});
+
+test("typed alarms order entries, cancel and rearm, retry independently, and accept nested schedules", async () => {
+  const { Alarms } = await import("../src/alarms");
+  const db = new DatabaseSync(":memory:");
+  const scheduler = {
+    setAlarm: vi.fn<(time: number | Date) => Promise<void>>(async () => {}),
+    deleteAlarm: vi.fn<() => Promise<void>>(async () => {}),
+  };
+  const ctx = {
+    props: { scheduler },
+    storage: {
+      sql: {
+        exec: (query: string, ...bindings: (string | number | null)[]) => {
+          if (!bindings.length && query.includes("CREATE TABLE")) {
+            db.exec(query);
+            return;
+          }
+          const rows = db.prepare(query).all(...bindings);
+          return { toArray: () => rows, one: () => rows[0] };
+        },
+      },
+    },
+  } as unknown as ConstructorParameters<typeof Alarms>[0];
+  const seen: string[] = [];
+  let fail = true;
+  const handlers = {
+    reminder: async (payload: { text: string }) => {
+      if (payload.text === "retry" && fail) throw new Error("retry");
+      seen.push(payload.text);
+      if (payload.text === "parent") await queue.schedule("cleanup", 1, { key: "child" });
+    },
+    cleanup: async (payload: { key: string }) => {
+      seen.push(payload.key);
+    },
+  };
+  const queue = new Alarms(ctx, handlers);
+  const cancelled = await queue.schedule("cleanup", 2, { key: "cancelled" });
+  await queue.schedule("reminder", 3, { text: "first" });
+  await queue.cancel(cancelled);
+  assert.equal(scheduler.setAlarm.mock.lastCall?.[0], 3);
+  await queue.schedule("reminder", 3, { text: "second" });
+  await queue.schedule("cleanup", 4, { key: "third" });
+  await queue.schedule("reminder", 5, { text: "retry" });
+  await queue.schedule("reminder", 6, { text: "parent" });
+  await queue.run();
+  assert.deepEqual(seen, ["first", "second", "third", "parent"]);
+  assert.equal(queue.list("reminder")[0].attempts, 1);
+  assert(queue.list("reminder")[0].time > Date.now());
+  await queue.run();
+  assert.equal(seen.at(-1), "child");
+  fail = false;
+  db.exec("UPDATE alarms SET time = 1");
+  await new Alarms(ctx, handlers).run();
+  assert.equal(seen.at(-1), "retry");
+  assert.deepEqual(queue.list(), []);
+  assert(scheduler.deleteAlarm.mock.calls.length > 0);
+});
+
+test("unknown alarm types retry and drop after ten failures", async () => {
+  const h = facet();
+  // The production queue sees old persisted types that current handlers no longer recognize.
+  const { Alarms } = await import("../src/alarms");
+  const db = new DatabaseSync(":memory:");
+  const scheduler = h.props.scheduler;
+  const ctx = {
+    props: { scheduler },
+    storage: {
+      sql: {
+        exec: (query: string, ...bindings: (string | number | null)[]) => {
+          if (!bindings.length && query.includes("CREATE TABLE")) {
+            db.exec(query);
+            return;
+          }
+          const rows = db.prepare(query).all(...bindings);
+          return { toArray: () => rows, one: () => rows[0] };
+        },
+      },
+    },
+  } as unknown as ConstructorParameters<typeof Alarms>[0];
+  const queue = new Alarms(ctx, {});
+  db.exec("INSERT INTO alarms (type,time,payload,attempts) VALUES ('removed',1,'{}',0)");
+  await queue.run();
+  assert.equal(queue.list()[0].attempts, 1);
+  const error = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    for (let i = 1; i < 10; i++) {
+      db.exec("UPDATE alarms SET time = 1");
+      await queue.run();
+    }
+    assert.deepEqual(queue.list(), []);
+    assert.equal(error.mock.calls.length, 1);
+  } finally {
+    error.mockRestore();
+  }
 });

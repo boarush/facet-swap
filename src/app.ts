@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
+import { Alarms } from "./alarms";
 import { isDenied, type ScopedNotes } from "./notes";
 import { createRouter } from "./router";
 import type { Scheduler } from "./scheduler";
@@ -21,14 +22,25 @@ export class App extends DurableObject<AppEnv, AppProps> {
     return this.alarm(info);
   }
 
-  async alarm(_info?: AlarmInvocationInfo): Promise<void> {
-    // RPC before any write, so a failed call leaves nothing behind for the retry to double.
-    const scheduled = await this.ctx.props.scheduler.getAlarm();
+  private readonly alarms = new Alarms(this.ctx, {
+    reminder: async (payload: { text: string }) => {
+      this.delivered("reminder", payload);
+    },
+    cleanup: async (payload: { key: string }) => {
+      this.delivered("cleanup", payload);
+    },
+  });
+
+  private delivered(type: string, payload: unknown): void {
     this.ctx.storage.transactionSync(() => {
       const count = this.ctx.storage.kv.get<number>("alarms") ?? 0;
       this.ctx.storage.kv.put("alarms", count + 1);
-      this.ctx.storage.kv.put("last-alarm", { hash: this.env.HASH, scheduled });
+      this.ctx.storage.kv.put("last-alarm", { hash: this.env.HASH, type, payload });
     });
+  }
+
+  async alarm(_info?: AlarmInvocationInfo): Promise<void> {
+    await this.alarms.run();
   }
 
   private readonly router = createRouter<AppEnv>()
@@ -44,18 +56,33 @@ export class App extends DurableObject<AppEnv, AppProps> {
     .on(["GET", "PUT", "DELETE"], "/alarm", async (c) => {
       const request = c.req.raw;
       if (request.method === "PUT") {
-        const { time } = await request.json<{ time: number }>();
+        const { type, time, payload } = await request.json<{
+          type: string;
+          time: number;
+          payload: unknown;
+        }>();
         if (!Number.isSafeInteger(time) || time <= 0) {
           return new Response("Invalid alarm time", { status: 400 });
         }
-        await this.ctx.props.scheduler.setAlarm(time);
+        const id =
+          type === "reminder" && hasString(payload, "text")
+            ? await this.alarms.schedule(type, time, { text: payload.text })
+            : type === "cleanup" && hasString(payload, "key")
+              ? await this.alarms.schedule(type, time, { key: payload.key })
+              : null;
+        if (id === null) return new Response("Invalid alarm type or payload", { status: 400 });
+        return Response.json({ id });
       } else if (request.method === "DELETE") {
-        await this.ctx.props.scheduler.deleteAlarm();
+        const raw = c.req.query("id");
+        const id = Number(raw);
+        if (!raw || !Number.isSafeInteger(id) || id <= 0)
+          return new Response("Invalid alarm id", { status: 400 });
+        await this.alarms.cancel(id);
       } else if (request.method !== "GET") {
         return new Response("Method not allowed", { status: 405 });
       }
       return Response.json({
-        scheduled: await this.ctx.props.scheduler.getAlarm(),
+        alarms: this.alarms.list(),
         count: this.ctx.storage.kv.get<number>("alarms") ?? 0,
         last: this.ctx.storage.kv.get("last-alarm") ?? null,
       });
@@ -151,6 +178,11 @@ export class App extends DurableObject<AppEnv, AppProps> {
     });
   }
 }
+
+const hasString = <K extends string>(value: unknown, key: K): value is Record<K, string> =>
+  typeof value === "object" &&
+  value !== null &&
+  typeof (value as Record<K, unknown>)[key] === "string";
 
 // Loader preflight compiles the module without constructing or invoking the durable facet.
 export default { fetch: () => new Response(null, { status: 204 }) };
