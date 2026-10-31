@@ -43,6 +43,7 @@ type Status = {
   swaps: Swap[];
   inflight: number;
   swapping: boolean;
+  facets: { name: string; createdAt: number; loadedHash: string; loadedAt: number }[];
 };
 type Swap = {
   oldHash: string | null;
@@ -189,6 +190,11 @@ test.provider(
         }
         assert.equal((await get<Status>(diagnosticUser + "/__status?swaps=0")).inflight, 0);
         assert.deepEqual((await get<Status>(diagnosticUser + "/__status?swaps=0")).swaps, []);
+        const loaded = await get<Status>(diagnosticUser + "/__status?swaps=0");
+        assert.deepEqual(
+          loaded.facets.map(({ name, loadedHash }) => ({ name, loadedHash })),
+          [{ name: "app", loadedHash: loaded.current!.hash }],
+        );
         assert.equal((await fetch(base + diagnosticUser + "/__status?swaps=-1")).status, 400);
         assert.equal((await fetch(base + diagnosticUser + "/swaps")).status, 404);
         pass("diagnostics are GET/HEAD only; status includes optional swap history");

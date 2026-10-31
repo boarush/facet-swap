@@ -48,6 +48,11 @@ export class Supervisor extends DurableObject<Env> {
         forced INTEGER NOT NULL, abortedStreams INTEGER NOT NULL, restartCommit INTEGER NOT NULL
       )
     `);
+    ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS facets (
+        name TEXT PRIMARY KEY, createdAt INTEGER NOT NULL, loadedHash TEXT NOT NULL, loadedAt INTEGER NOT NULL
+      )
+    `);
     // Inflight tracking cannot survive restart; finish any persisted pending swap on wake.
     this.swap(false, true);
   }
@@ -70,6 +75,7 @@ export class Supervisor extends DurableObject<Env> {
         inflight: this.active.size,
         swapping: this.swapping,
         swaps,
+        facets: this.ctx.storage.sql.exec("SELECT * FROM facets ORDER BY name").toArray(),
       });
     })
     .all("/__status", () => new Response("Method not allowed", { status: 405 }))
@@ -284,7 +290,18 @@ export class Supervisor extends DurableObject<Env> {
   private app() {
     const { hash, readOnly } = this.state.current!;
     const scope = { supervisorId: this.ctx.id.toString(), readOnly };
-    return this.ctx.facets.get("app", () => loadApp(this.env, hash, scope));
+    return this.ctx.facets.get("app", () => {
+      // The callback runs only when the runtime instantiates the facet, so this records real loads.
+      this.ctx.storage.sql.exec(
+        `INSERT INTO facets VALUES (?, ?, ?, ?)
+          ON CONFLICT (name) DO UPDATE SET loadedHash = excluded.loadedHash, loadedAt = excluded.loadedAt`,
+        "app",
+        Date.now(),
+        hash,
+        Date.now(),
+      );
+      return loadApp(this.env, hash, scope);
+    });
   }
 
   private beginWork() {

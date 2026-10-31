@@ -493,6 +493,7 @@ test("swap diagnostics are read-only, bypass checks, and retain only the newest 
   const status = await h.status();
   assert.deepEqual(Object.keys(status).sort(), [
     "current",
+    "facets",
     "inflight",
     "pending",
     "pendingSince",
