@@ -38,7 +38,7 @@ npm run dev:refresh -- ''       # clear the salt
 
 A different salt changes the hash without a source edit; reusing the same salt does not force publication. Starting dev also evaluates the current source and salt.
 
-`DRAIN_DEADLINE_MS` sets the drain deadline; `CHECK_INTERVAL_MS` sets the update-check interval. Zero means an immediate deadline or a check on every request, respectively. `PORT` sets the local port.
+`DRAIN_DEADLINE_MS` sets the drain deadline (keep it to tens of seconds; see [Architecture](ARCHITECTURE.md)); `CHECK_INTERVAL_MS` sets the update-check interval. Zero means an immediate deadline or a check on every request, respectively. `PORT` sets the local port.
 
 ## Deploy to Cloudflare
 

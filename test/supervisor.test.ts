@@ -9,6 +9,8 @@ vi.mock("cloudflare:workers", () => ({
   exports: {
     ScopedNotes: () => ({}),
     Scheduler: () => ({}),
+    Versions: () => ({}),
+    Swap: () => ({}),
   },
   DurableObject: class {
     ctx: DurableObjectState;
@@ -30,6 +32,7 @@ afterEach(() => {
 
 type Swap = {
   id: number;
+  facet: string | null;
   oldHash: string | null;
   newHash: string;
   kind: "code" | "scope";
@@ -98,15 +101,25 @@ function harness() {
     transaction: async <T>(fn: (transaction: Storage) => Promise<T>): Promise<T> => fn(storage),
   };
   const facet = {
+    closeSockets: vi.fn<() => Promise<void>>(async () => {}),
     dispatchAlarm: vi.fn<(info?: AlarmInvocationInfo) => Promise<void>>(async () => {}),
     fetch: async (_request: Request): Promise<Response> => new Response(),
   };
+  const loaded = new Set(["app"]);
   const ctx = {
     id: { toString: () => "user" },
     storage,
     facets: {
-      get: vi.fn<(name: string) => typeof facet>(() => facet),
-      abort: vi.fn<(name: string, reason: Error) => void>(),
+      get: vi.fn<(name: string, factory: () => unknown) => typeof facet>((name, factory) => {
+        if (!loaded.has(name)) {
+          factory();
+          loaded.add(name);
+        }
+        return facet;
+      }),
+      abort: vi.fn<(name: string, reason: Error) => void>((name) => {
+        loaded.delete(name);
+      }),
     },
   };
   const env = {
@@ -180,31 +193,6 @@ function harness() {
   };
 }
 
-test("failed delivery persists across Supervisor restart and is retried on latest code", async () => {
-  const h = harness();
-  const due = Date.now() - 1;
-  await h.supervisor.setAlarm("app", due);
-  h.facet.dispatchAlarm.mockImplementationOnce(async () => {
-    assert.equal(h.supervisor.getAlarm("app"), null);
-    assert.equal((await h.status()).inflight, 1);
-    throw new Error("transient");
-  });
-  await assert.rejects(h.supervisor.alarm(), /transient/);
-  assert.equal(h.supervisor.getAlarm("app"), due);
-  assert.equal((await h.status()).inflight, 0);
-  h.env.latest = hash(2);
-  const restarted = h.create();
-  assert.equal(restarted.getAlarm("app"), due);
-  await restarted.alarm({ scheduledTime: due, retryCount: 1, isRetry: true });
-  assert.equal(restarted.getAlarm("app"), null);
-  assert.equal((await h.status(restarted)).current!.hash, hash(2));
-  assert.deepEqual(h.facet.dispatchAlarm.mock.calls[1][0], {
-    scheduledTime: due,
-    retryCount: 1,
-    isRetry: true,
-  });
-});
-
 test("handler rearming for the same timestamp is not erased on completion", async () => {
   const h = harness();
   const due = Date.now() - 1;
@@ -244,37 +232,6 @@ test("a stale native callback cannot deliver an alarm replaced with a future tim
   assert.equal(h.supervisor.getAlarm("app"), future);
 });
 
-test("an executing alarm counts as inflight and a hard swap retries it on new code", async () => {
-  vi.useFakeTimers();
-  const h = harness();
-  const due = Date.now() - 1;
-  await h.supervisor.setAlarm("app", due);
-  let interrupt: ((reason: Error) => void) | undefined;
-  h.facet.dispatchAlarm.mockImplementationOnce(
-    () =>
-      new Promise<void>((_resolve, reject) => {
-        interrupt = reject;
-      }),
-  );
-  h.ctx.facets.abort.mockImplementation(() => interrupt?.(new Error("facet aborted")));
-  const delivery = h.supervisor.alarm();
-  const rejected = assert.rejects(delivery, /facet aborted/);
-  await vi.waitFor(async () => assert.equal((await h.status()).inflight, 1));
-  h.env.latest = hash(2);
-  const response = await h.fetch("/version");
-  assert.equal(response.status, 503);
-  assert.equal((await h.status()).pending!.hash, hash(2));
-  await vi.advanceTimersByTimeAsync(3000);
-  await rejected;
-  assert.equal((await h.status()).current!.hash, hash(2));
-  assert.equal((await h.status()).inflight, 0);
-  assert.equal((await h.swaps())[0].abortedStreams, 0);
-  assert.equal((await h.swaps())[0].forced, true);
-  assert.equal(h.supervisor.getAlarm("app"), due);
-  await h.supervisor.alarm();
-  assert.equal(h.supervisor.getAlarm("app"), null);
-});
-
 test("pending swap and due alarm both survive reconstruction without a fresh drain window", async () => {
   const h = harness();
   const due = Date.now() - 1;
@@ -291,6 +248,7 @@ test("pending swap and due alarm both survive reconstruction without a fresh dra
   assert.equal(restarted.getAlarm("app"), due);
   assert.deepEqual((await h.swaps(restarted))[0], {
     id: 1,
+    facet: "app",
     oldHash: hash(1),
     newHash: hash(2),
     kind: "code",
@@ -303,55 +261,6 @@ test("pending swap and due alarm both survive reconstruction without a fresh dra
   assert.equal((await h.swaps(h.create())).length, 1);
   await restarted.alarm();
   assert.equal(restarted.getAlarm("app"), null);
-});
-
-test("Hono control routes retain update-check ordering and do not reach the facet", async () => {
-  const h = harness();
-  h.env.latest = hash(2);
-  assert.equal((await h.status()).current!.hash, hash(1));
-  assert.equal(h.ctx.facets.abort.mock.calls.length, 0);
-  const methodError = await h.fetch("/__scope");
-  assert.equal(methodError.status, 405);
-  assert.equal(await methodError.text(), "Method not allowed");
-  assert.equal((await h.status()).current!.hash, hash(2));
-  const invalid = await h.fetch("/__scope", { method: "PUT", body: '{"readOnly":"yes"}' });
-  assert.equal(invalid.status, 400);
-  await assert.rejects(h.fetch("/__scope", { method: "PUT", body: "invalid json" }), SyntaxError);
-  assert.equal(h.ctx.facets.get.mock.calls.length, 0);
-});
-
-test("a scope change during code preflight is not overwritten", async () => {
-  const h = harness();
-  let sendBody!: (body: string) => void;
-  const body = new ReadableStream<Uint8Array>({
-    start(controller) {
-      sendBody = (text) => {
-        controller.enqueue(new TextEncoder().encode(text));
-        controller.close();
-      };
-    },
-  });
-  // The scope request passes its update check, then waits on its body.
-  const scope = h.fetch("/__scope", { method: "PUT", body, duplex: "half" } as RequestInit);
-  await vi.waitFor(() => assert.equal(h.env.VERSIONS.get.mock.calls.length, 1));
-  // Let that check settle so the next request starts its own.
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  let finishPreflight!: () => void;
-  const preflightGate = new Promise<void>((resolve) => (finishPreflight = resolve));
-  h.env.CODE.get.mockImplementationOnce(async () => {
-    await preflightGate;
-    return { text: async () => "module" };
-  });
-  h.env.latest = hash(2);
-  const update = h.fetch("/version");
-  await vi.waitFor(() => assert.equal(h.env.CODE.get.mock.calls.length, 1));
-  sendBody('{"readOnly":true}');
-  assert.equal((await scope).status, 200);
-  finishPreflight();
-  await update;
-  const { current, pending } = await h.status();
-  assert.equal((pending ?? current)!.hash, hash(2));
-  assert.equal((pending ?? current)!.readOnly, true);
 });
 
 test("unchanged scope is a no-op instead of a drain", async () => {
@@ -378,7 +287,282 @@ test("HEAD cancels the Supervisor response wrapper instead of leaking inflight",
   assert.equal((await h.status()).inflight, 0);
 });
 
-test("normal body drain logs one unforced swap with its original pending time", async () => {
+test("initial activation and legacy pending state are logged without invented drain time", async () => {
+  const h = harness();
+  h.data.set("app-config", {
+    current: null,
+    pending: { hash: hash(1), generation: 1, readOnly: false },
+  });
+  const restarted = h.create();
+  const [row] = await h.swaps(restarted);
+  assert.equal(row.oldHash, null);
+  assert.equal(row.kind, "code");
+  assert.equal(row.pendingSince, row.swappedAt);
+  assert.equal(row.restartCommit, true);
+});
+
+test("facets arm the minimum wake-up and deliver only their own due alarm", async () => {
+  const h = harness();
+  h.storage.sql.exec(
+    "INSERT INTO facets (name, createdAt, loadedHash, loadedAt) VALUES ('other', ?, ?, ?)",
+    Date.now(),
+    hash(1),
+    Date.now(),
+  );
+  const other = {
+    ...h.facet,
+    dispatchAlarm: vi.fn<() => Promise<void>>(async () => {}),
+    fetch: h.facet.fetch,
+  };
+  h.ctx.facets.get.mockImplementation((name: string) => (name === "other" ? other : h.facet));
+  const due = Date.now() - 1;
+  const future = Date.now() + 60000;
+  await h.supervisor.setAlarm("other", future);
+  await h.supervisor.setAlarm("app", due);
+  assert.equal(h.native(), due);
+  assert.equal(h.supervisor.getAlarm("other"), future);
+  await h.supervisor.alarm();
+  assert.equal(h.facet.dispatchAlarm.mock.calls.length, 1);
+  assert.equal(other.dispatchAlarm.mock.calls.length, 0);
+  assert.equal(h.supervisor.getAlarm("app"), null);
+  assert.equal(h.native(), future);
+  await h.supervisor.setAlarm("other", due);
+  await h.supervisor.alarm();
+  assert.equal(other.dispatchAlarm.mock.calls.length, 1);
+  assert.equal(h.facet.dispatchAlarm.mock.calls.length, 1);
+  assert.equal(h.native(), null);
+});
+
+test("a failed facet does not block another due facet and retains only its own retry", async () => {
+  const h = harness();
+  h.storage.sql.exec(
+    "INSERT INTO facets (name, createdAt, loadedHash, loadedAt) VALUES ('other', ?, ?, ?)",
+    Date.now(),
+    hash(1),
+    Date.now(),
+  );
+  const other = {
+    ...h.facet,
+    dispatchAlarm: vi.fn<() => Promise<void>>(async () => {
+      assert.equal(h.supervisor.getAlarm("other"), null);
+      assert.equal(h.supervisor.getAlarm("app"), due);
+      await h.supervisor.deleteAlarm("other");
+    }),
+    fetch: h.facet.fetch,
+  };
+  h.ctx.facets.get.mockImplementation((name: string) => (name === "other" ? other : h.facet));
+  const due = Date.now() - 1;
+  await h.supervisor.setAlarm("app", due);
+  await h.supervisor.setAlarm("other", due);
+  h.facet.dispatchAlarm.mockRejectedValueOnce(new Error("app failed"));
+  const arm = vi.spyOn(h.storage, "setAlarm");
+  await assert.rejects(h.supervisor.alarm(), /app failed/);
+  assert.equal(arm.mock.calls.length, 0);
+  assert.equal(other.dispatchAlarm.mock.calls.length, 1);
+  assert.equal(h.supervisor.getAlarm("other"), null);
+  assert.equal(h.supervisor.getAlarm("app"), due);
+  assert.equal(h.native(), due);
+  await h.supervisor.alarm();
+  assert.equal(h.native(), null);
+  assert.equal(other.dispatchAlarm.mock.calls.length, 1);
+});
+
+test("fetch, controls and alarm delivery never read KV on their own", async () => {
+  const h = harness();
+  h.env.latest = hash(2);
+  const response = await h.fetch("/version");
+  await response.body?.cancel();
+  await h.fetch("/__scope");
+  await h.supervisor.setAlarm("app", Date.now() - 1);
+  await h.supervisor.alarm();
+  assert.equal(h.env.VERSIONS.get.mock.calls.length, 0);
+  assert.equal((await h.status()).current!.hash, hash(1));
+});
+
+test("pending validates publication and ready swaps without response-lifetime gating", async () => {
+  const h = harness();
+  h.env.latest = hash(2);
+  assert.equal(await h.supervisor.pending(hash(3)), false);
+  assert.equal((await h.status()).pending, null);
+  assert.equal(await h.supervisor.pending("../escape"), false);
+  assert.equal(await h.supervisor.pending(hash(2)), true);
+  assert.equal((await h.fetch("/version")).status, 503);
+  h.supervisor.ready("app");
+  assert.equal((await h.status()).current!.hash, hash(2));
+  assert.equal((await h.swaps())[0].forced, false);
+  assert.deepEqual(
+    h.ctx.facets.abort.mock.calls.map(([name]) => name),
+    ["app"],
+  );
+});
+
+test("a pending target keeps the original deadline and forced SSE suffix", async () => {
+  vi.useFakeTimers();
+  const h = harness();
+  h.facet.fetch = async () =>
+    new Response(new ReadableStream(), { headers: { "content-type": "text/event-stream" } });
+  const response = await h.fetch("/stream");
+  const done = response.text();
+  h.env.latest = hash(2);
+  await h.supervisor.pending(hash(2));
+  const pendingSince = (await h.status()).pendingSince;
+  await vi.advanceTimersByTimeAsync(1000);
+  h.env.latest = hash(3);
+  await h.supervisor.pending(hash(3));
+  assert.equal((await h.status()).pendingSince, pendingSince);
+  await vi.advanceTimersByTimeAsync(2000);
+  assert.match(await done, /update-abort/);
+  assert.equal((await h.status()).current!.hash, hash(3));
+  const [row] = await h.swaps();
+  assert.equal(row.forced, true);
+  assert.equal(row.abortedStreams, 1);
+});
+
+test("preflight errors and stale generations preserve current code", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const h = harness();
+  h.env.latest = hash(2);
+  h.env.CODE.get.mockResolvedValueOnce(null);
+  assert.equal(await h.supervisor.pending(hash(2)), false);
+  assert.equal(await h.supervisor.pending(hash(2)), true);
+  h.supervisor.ready("app");
+  h.env.latest = hash(1);
+  h.env.generation = 1;
+  assert.equal(await h.supervisor.pending(hash(1)), false);
+  assert.equal((await h.status()).current!.hash, hash(2));
+  await (await h.fetch("/version")).body?.cancel();
+  h.env.generation = 3;
+  assert.equal(await h.supervisor.pending(hash(1)), true);
+  h.supervisor.ready("app");
+  assert.equal((await h.status()).current!.generation, 3);
+});
+
+test("scope changes during preflight remain on the pending target", async () => {
+  const h = harness();
+  h.env.latest = hash(2);
+  let finish!: () => void;
+  h.env.CODE.get.mockImplementationOnce(async () => {
+    await new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    return { text: async () => "module" };
+  });
+  const pending = h.supervisor.pending(hash(2));
+  await vi.waitFor(() => assert(finish));
+  await h.fetch("/__scope", { method: "PUT", body: '{"readOnly":true}' });
+  finish();
+  await pending;
+  h.supervisor.ready("app");
+  assert.equal((await h.status()).current!.readOnly, true);
+});
+
+test("swaps preserve independent alarms and abort every registered facet", async () => {
+  const h = harness();
+  h.storage.sql.exec(
+    "INSERT INTO facets (name,createdAt,loadedHash,loadedAt) VALUES ('other',1,?,1)",
+    hash(1),
+  );
+  const time = Date.now() + 60000;
+  await h.supervisor.setAlarm("other", time);
+  h.env.latest = hash(2);
+  await h.supervisor.pending(hash(2));
+  h.supervisor.ready("app");
+  h.supervisor.ready("other");
+  assert.deepEqual(h.ctx.facets.abort.mock.calls.map(([name]) => name).sort(), ["app", "other"]);
+  assert.equal(h.supervisor.getAlarm("other"), time);
+});
+
+test("101 responses pass through unchanged and do not count as work", async () => {
+  const h = harness();
+  const response = new Response();
+  Object.defineProperty(response, "status", { value: 101 });
+  h.facet.fetch = async () => response;
+  assert.equal(await h.fetch("/ws", { headers: { Upgrade: "websocket" } }), response);
+  assert.equal((await h.status()).inflight, 0);
+});
+
+test("a slow old preflight cannot supersede a newer facet's target", async () => {
+  const h = harness();
+  h.env.latest = hash(2);
+  let finish!: () => void;
+  h.env.CODE.get.mockImplementationOnce(async () => {
+    await new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    return { text: async () => "module" };
+  });
+  const older = h.supervisor.pending(hash(2));
+  await vi.waitFor(() => assert(finish));
+  h.env.latest = hash(3);
+  assert.equal(await h.supervisor.pending(hash(3)), true);
+  finish();
+  assert.equal(await older, false);
+  assert.equal((await h.status()).pending!.hash, hash(3));
+  h.supervisor.ready("app");
+});
+
+test("failed delivery persists across Supervisor restart and is retried on latest code", async () => {
+  const h = harness();
+  const due = Date.now() - 1;
+  await h.supervisor.setAlarm("app", due);
+  h.facet.dispatchAlarm.mockImplementationOnce(async () => {
+    assert.equal(h.supervisor.getAlarm("app"), null);
+    assert.equal((await h.status()).inflight, 1);
+    throw new Error("transient");
+  });
+  await assert.rejects(h.supervisor.alarm(), /transient/);
+  assert.equal(h.supervisor.getAlarm("app"), due);
+  assert.equal((await h.status()).inflight, 0);
+  h.env.latest = hash(2);
+  const restarted = h.create();
+  assert.equal(restarted.getAlarm("app"), due);
+  await restarted.pending(hash(2));
+  restarted.ready("app");
+  await restarted.alarm({ scheduledTime: due, retryCount: 1, isRetry: true });
+  assert.equal(restarted.getAlarm("app"), null);
+  assert.equal((await h.status(restarted)).current!.hash, hash(2));
+  assert.deepEqual(h.facet.dispatchAlarm.mock.calls[1][0], {
+    scheduledTime: due,
+    retryCount: 1,
+    isRetry: true,
+  });
+});
+
+test("an executing alarm counts as inflight and a hard swap retries it on new code", async () => {
+  vi.useFakeTimers();
+  const h = harness();
+  const due = Date.now() - 1;
+  await h.supervisor.setAlarm("app", due);
+  let interrupt: ((reason: Error) => void) | undefined;
+  h.facet.dispatchAlarm.mockImplementationOnce(
+    () =>
+      new Promise<void>((_resolve, reject) => {
+        interrupt = reject;
+      }),
+  );
+  h.ctx.facets.abort.mockImplementation(() => interrupt?.(new Error("facet aborted")));
+  const delivery = h.supervisor.alarm();
+  const rejected = assert.rejects(delivery, /facet aborted/);
+  await vi.waitFor(async () => assert.equal((await h.status()).inflight, 1));
+  h.env.latest = hash(2);
+  await h.supervisor.pending(h.env.latest);
+  const response = await h.fetch("/version");
+  assert.equal(response.status, 503);
+  assert.equal((await h.status()).pending!.hash, hash(2));
+  h.supervisor.ready("app");
+  assert.equal(h.ctx.facets.abort.mock.calls.length, 0);
+  await vi.advanceTimersByTimeAsync(3000);
+  await rejected;
+  assert.equal((await h.status()).current!.hash, hash(2));
+  assert.equal((await h.status()).inflight, 0);
+  assert.equal((await h.swaps())[0].abortedStreams, 0);
+  assert.equal((await h.swaps())[0].forced, true);
+  assert.equal(h.supervisor.getAlarm("app"), due);
+  await h.supervisor.alarm();
+  assert.equal(h.supervisor.getAlarm("app"), null);
+});
+
+test("application readiness after body drain logs one unforced swap with its original pending time", async () => {
   vi.useFakeTimers();
   const h = harness();
   let source!: ReadableStreamDefaultController<Uint8Array>;
@@ -394,6 +578,7 @@ test("normal body drain logs one unforced swap with its original pending time", 
   const done = response.text();
   const pendingSince = Date.now();
   h.env.latest = hash(2);
+  await h.supervisor.pending(h.env.latest);
   assert.equal((await h.fetch("/version")).status, 503);
   assert.deepEqual(await h.swaps(), []);
   const draining = await h.status();
@@ -402,13 +587,16 @@ test("normal body drain logs one unforced swap with its original pending time", 
   assert.equal(draining.swapping, false);
   await vi.advanceTimersByTimeAsync(100);
   h.env.latest = hash(3);
+  await h.supervisor.pending(h.env.latest);
   assert.equal((await h.fetch("/version")).status, 503);
   await vi.advanceTimersByTimeAsync(100);
   source.close();
   await done;
+  h.supervisor.ready("app");
   assert.deepEqual(await h.swaps(), [
     {
       id: 1,
+      facet: "app",
       oldHash: hash(1),
       newHash: hash(3),
       kind: "code",
@@ -436,13 +624,14 @@ test("deadline logs forced code and scope swaps with the aborted body count", as
   const secondDone = second.text();
   const pendingSince = Date.now();
   h.env.latest = hash(2);
-  await h.fetch("/version");
+  await h.supervisor.pending(h.env.latest);
   await vi.advanceTimersByTimeAsync(3000);
   assert.match(await firstDone, /update-abort/);
   assert.match(await secondDone, /update-abort/);
   assert.deepEqual(await h.swaps(), [
     {
       id: 1,
+      facet: "app",
       oldHash: hash(1),
       newHash: hash(2),
       kind: "code",
@@ -471,9 +660,12 @@ test("deadline logs forced code and scope swaps with the aborted body count", as
 test("swap diagnostics are read-only, bypass checks, and retain only the newest 100 rows", async () => {
   const h = harness();
   for (let i = 2; i <= 106; i++) {
+    await (await h.fetch("/version")).body?.cancel();
     h.env.latest = hash(i);
-    await h.fetch("/version");
+    await h.supervisor.pending(h.env.latest);
+    h.supervisor.ready("app");
   }
+  h.ctx.facets.get.mockClear();
   h.env.latest = "not-observed";
   h.env.VERSIONS.get.mockClear();
   const rows = await h.swaps(h.supervisor, "?swaps=200");
@@ -510,77 +702,7 @@ test("swap diagnostics are read-only, bypass checks, and retain only the newest 
   assert.equal(status.current!.hash, hash(106));
   assert.equal(status.pendingSince, null);
   assert.equal(h.env.VERSIONS.get.mock.calls.length, 0);
-  assert.equal(h.ctx.facets.get.mock.calls.length, 105);
-});
-
-test("initial activation and legacy pending state are logged without invented drain time", async () => {
-  const h = harness();
-  h.data.set("app-config", {
-    current: null,
-    pending: { hash: hash(1), generation: 1, readOnly: false },
-  });
-  const restarted = h.create();
-  const [row] = await h.swaps(restarted);
-  assert.equal(row.oldHash, null);
-  assert.equal(row.kind, "code");
-  assert.equal(row.pendingSince, row.swappedAt);
-  assert.equal(row.restartCommit, true);
-});
-
-test("non-increasing publications cannot replace a newer pending or committed generation", async () => {
-  const h = harness();
-  h.facet.fetch = async () => new Response(new ReadableStream());
-  const response = await h.fetch("/stream");
-  h.env.latest = hash(3);
-  assert.equal((await h.fetch("/version")).status, 503);
-  assert.equal((await h.status()).pending!.generation, 3);
-  for (const generation of [2, 3]) {
-    h.env.latest = hash(2);
-    h.env.generation = generation;
-    await h.fetch("/version");
-    assert.equal((await h.status()).pending!.hash, hash(3));
-  }
-  await response.body!.cancel();
-  assert.equal((await h.status()).current!.generation, 3);
-  const restarted = h.create();
-  await h.fetch("/version", { method: "HEAD" }, restarted);
-  assert.equal((await h.status(restarted)).current!.hash, hash(3));
-  assert.equal(h.env.CODE.get.mock.calls.length, 1);
-  const scoped = await h.fetch(
-    "/__scope",
-    {
-      method: "PUT",
-      body: '{"readOnly":true}',
-    },
-    restarted,
-  );
-  assert.equal(scoped.status, 200);
-  assert.equal((await h.status(restarted)).current!.generation, 3);
-});
-
-test("KV failure serves current requests and alarms, then retries at the next interval", async () => {
-  vi.useFakeTimers();
-  const diagnostic = vi.spyOn(console, "error").mockImplementation(() => {});
-  const h = harness();
-  h.env.CHECK_INTERVAL_MS = "100";
-  h.env.VERSIONS.get.mockRejectedValueOnce(new Error("KV unavailable"));
-  assert.equal((await h.fetch("/version")).status, 200);
-  await h.supervisor.setAlarm("app", Date.now() - 1);
-  await h.supervisor.alarm();
-  assert.equal(h.facet.dispatchAlarm.mock.calls.length, 1);
-  assert.equal(h.env.VERSIONS.get.mock.calls.length, 1);
-  h.env.latest = hash(2);
-  await vi.advanceTimersByTimeAsync(100);
-  h.env.VERSIONS.get.mockRejectedValueOnce(new Error("KV unavailable on alarm"));
-  await h.supervisor.setAlarm("app", Date.now() - 1);
-  await h.supervisor.alarm();
-  assert.equal(h.facet.dispatchAlarm.mock.calls.length, 2);
-  assert.equal((await h.status()).current!.hash, hash(1));
-  await vi.advanceTimersByTimeAsync(100);
-  const response = await h.fetch("/version");
-  await response.body?.cancel();
-  assert.equal((await h.status()).current!.hash, hash(2));
-  assert.equal(diagnostic.mock.calls.length, 2);
+  assert.equal(h.ctx.facets.get.mock.calls.length, 0);
 });
 
 test("malformed publications and missing code never stage; repaired code retries successfully", async () => {
@@ -589,6 +711,7 @@ test("malformed publications and missing code never stage; repaired code retries
   h.env.generation = 2;
   for (const invalid of ["../escape", "a".repeat(63), "A".repeat(64)]) {
     h.env.latest = invalid;
+    await h.supervisor.pending(hash(2));
     const response = await h.fetch("/version");
     await response.body?.cancel();
     assert.equal((await h.status()).current!.hash, hash(1));
@@ -597,6 +720,7 @@ test("malformed publications and missing code never stage; repaired code retries
   assert.equal(h.env.CODE.get.mock.calls.length, 0);
   h.env.latest = hash(2);
   h.env.CODE.get.mockResolvedValueOnce(null);
+  await h.supervisor.pending(hash(2));
   const response = await h.fetch("/version");
   await response.body?.cancel();
   assert.equal((await h.status()).current!.generation, 1);
@@ -604,8 +728,8 @@ test("malformed publications and missing code never stage; repaired code retries
   assert.deepEqual(await h.swaps(), []);
   assert.equal(h.ctx.facets.abort.mock.calls.length, 0);
   assert.equal(diagnostic.mock.calls.length, 4);
-  const repaired = await h.fetch("/version");
-  await repaired.body?.cancel();
+  await h.supervisor.pending(h.env.latest);
+  h.supervisor.ready("app");
   assert.equal((await h.status()).current!.hash, hash(2));
   assert.equal((await h.status()).current!.generation, 2);
   assert.equal(h.env.CODE.get.mock.calls.length, 2);
@@ -616,6 +740,7 @@ test("republishing identical code advances generation without aborting inflight 
   h.facet.fetch = async () => new Response(new ReadableStream());
   const response = await h.fetch("/stream");
   h.env.generation = 2;
+  await h.supervisor.pending(h.env.latest);
   const repeated = await h.fetch("/version", { method: "HEAD" });
   assert.equal(repeated.status, 200);
   assert.equal((await h.status()).pending, null);
@@ -628,10 +753,14 @@ test("republishing identical code advances generation without aborting inflight 
 test("a greater generation can deliberately republish an older content hash", async () => {
   const h = harness();
   h.env.latest = hash(2);
+  await h.supervisor.pending(h.env.latest);
+  h.supervisor.ready("app");
   let response = await h.fetch("/version");
   await response.body?.cancel();
   h.env.latest = hash(1);
   h.env.generation = 3;
+  await h.supervisor.pending(h.env.latest);
+  h.supervisor.ready("app");
   response = await h.fetch("/version");
   await response.body?.cancel();
   assert.equal((await h.status()).current!.hash, hash(1));
@@ -644,6 +773,7 @@ test("invalid generation and code read failure never close admission", async () 
   h.env.latest = hash(2);
   for (const generation of [0, -1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
     h.env.generation = generation;
+    await h.supervisor.pending(h.env.latest);
     const response = await h.fetch("/version");
     await response.body?.cancel();
     assert.equal((await h.status()).pending, null);
@@ -652,72 +782,12 @@ test("invalid generation and code read failure never close admission", async () 
   assert.equal(h.env.CODE.get.mock.calls.length, 0);
   h.env.generation = 2;
   h.env.CODE.get.mockRejectedValueOnce(new Error("code read failed"));
+  await h.supervisor.pending(h.env.latest);
   const response = await h.fetch("/version");
   await response.body?.cancel();
   assert.equal((await h.status()).pending, null);
   assert.equal((await h.status()).current!.hash, hash(1));
   assert.equal(diagnostic.mock.calls.length, 6);
-});
-
-test("facets arm the minimum wake-up and deliver only their own due alarm", async () => {
-  const h = harness();
-  h.storage.sql.exec(
-    "INSERT INTO facets (name, createdAt, loadedHash, loadedAt) VALUES ('other', ?, ?, ?)",
-    Date.now(),
-    hash(1),
-    Date.now(),
-  );
-  const other = { dispatchAlarm: vi.fn<() => Promise<void>>(async () => {}), fetch: h.facet.fetch };
-  h.ctx.facets.get.mockImplementation((name: string) => (name === "other" ? other : h.facet));
-  const due = Date.now() - 1;
-  const future = Date.now() + 60000;
-  await h.supervisor.setAlarm("other", future);
-  await h.supervisor.setAlarm("app", due);
-  assert.equal(h.native(), due);
-  assert.equal(h.supervisor.getAlarm("other"), future);
-  await h.supervisor.alarm();
-  assert.equal(h.facet.dispatchAlarm.mock.calls.length, 1);
-  assert.equal(other.dispatchAlarm.mock.calls.length, 0);
-  assert.equal(h.supervisor.getAlarm("app"), null);
-  assert.equal(h.native(), future);
-  await h.supervisor.setAlarm("other", due);
-  await h.supervisor.alarm();
-  assert.equal(other.dispatchAlarm.mock.calls.length, 1);
-  assert.equal(h.facet.dispatchAlarm.mock.calls.length, 1);
-  assert.equal(h.native(), null);
-});
-
-test("a failed facet does not block another due facet and retains only its own retry", async () => {
-  const h = harness();
-  h.storage.sql.exec(
-    "INSERT INTO facets (name, createdAt, loadedHash, loadedAt) VALUES ('other', ?, ?, ?)",
-    Date.now(),
-    hash(1),
-    Date.now(),
-  );
-  const other = {
-    dispatchAlarm: vi.fn<() => Promise<void>>(async () => {
-      assert.equal(h.supervisor.getAlarm("other"), null);
-      assert.equal(h.supervisor.getAlarm("app"), due);
-      await h.supervisor.deleteAlarm("other");
-    }),
-    fetch: h.facet.fetch,
-  };
-  h.ctx.facets.get.mockImplementation((name: string) => (name === "other" ? other : h.facet));
-  const due = Date.now() - 1;
-  await h.supervisor.setAlarm("app", due);
-  await h.supervisor.setAlarm("other", due);
-  h.facet.dispatchAlarm.mockRejectedValueOnce(new Error("app failed"));
-  const arm = vi.spyOn(h.storage, "setAlarm");
-  await assert.rejects(h.supervisor.alarm(), /app failed/);
-  assert.equal(arm.mock.calls.length, 0);
-  assert.equal(other.dispatchAlarm.mock.calls.length, 1);
-  assert.equal(h.supervisor.getAlarm("other"), null);
-  assert.equal(h.supervisor.getAlarm("app"), due);
-  assert.equal(h.native(), due);
-  await h.supervisor.alarm();
-  assert.equal(h.native(), null);
-  assert.equal(other.dispatchAlarm.mock.calls.length, 1);
 });
 
 test("deleting one facet alarm keeps the other armed and swaps abort every registered facet", async () => {
@@ -735,7 +805,333 @@ test("deleting one facet alarm keeps the other armed and swaps abort every regis
   assert.equal(h.supervisor.getAlarm("app"), null);
   assert.equal(h.native(), time + 1000);
   h.env.latest = hash(2);
-  await h.fetch("/version", { method: "HEAD" });
+  await h.supervisor.pending(h.env.latest);
+  h.supervisor.ready("app");
+  h.supervisor.ready("other");
   assert.deepEqual(h.ctx.facets.abort.mock.calls.map(([name]) => name).sort(), ["app", "other"]);
   assert.equal(h.supervisor.getAlarm("other"), time + 1000);
+});
+
+test("concurrent initial requests share one publication read and preflight", async () => {
+  const h = harness();
+  h.data.delete("app-config");
+  const fresh = h.create();
+  let finish!: () => void;
+  h.env.VERSIONS.get.mockImplementationOnce(async () => {
+    await new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    return { hash: hash(1), generation: 1 };
+  });
+  const first = h.fetch("/version", undefined, fresh);
+  const second = h.fetch("/version", undefined, fresh);
+  await vi.waitFor(() => assert(finish));
+  assert.equal(h.env.VERSIONS.get.mock.calls.length, 1);
+  finish();
+  for (const response of await Promise.all([first, second])) {
+    assert.equal(response.status, 200);
+    await response.body?.cancel();
+  }
+  assert.equal(h.env.VERSIONS.get.mock.calls.length, 1);
+  assert.equal(h.env.CODE.get.mock.calls.length, 1);
+  assert.equal((await h.status(fresh)).current!.hash, hash(1));
+  await h.fetch("/version", { method: "HEAD" }, fresh);
+  await fresh.alarm();
+  assert.equal(h.env.VERSIONS.get.mock.calls.length, 1);
+});
+
+test("initial alarm wake bootstraps without a second publication read", async () => {
+  const h = harness();
+  const due = Date.now() - 1;
+  await h.supervisor.setAlarm("app", due);
+  h.data.delete("app-config");
+  const fresh = h.create();
+  await fresh.alarm();
+  assert.equal(h.env.VERSIONS.get.mock.calls.length, 1);
+  assert.equal(h.facet.dispatchAlarm.mock.calls.length, 1);
+  assert.equal(fresh.getAlarm("app"), null);
+});
+
+test("failed initial preflight leaves admission closed and a later request retries", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const h = harness();
+  h.data.delete("app-config");
+  const fresh = h.create();
+  h.env.CODE.get.mockResolvedValueOnce(null);
+  assert.equal((await h.fetch("/version", undefined, fresh)).status, 503);
+  assert.equal((await h.status(fresh)).current, null);
+  assert.equal(h.env.VERSIONS.get.mock.calls.length, 1);
+  assert.equal((await h.fetch("/version", { method: "HEAD" }, fresh)).status, 200);
+  assert.equal(h.env.VERSIONS.get.mock.calls.length, 2);
+});
+
+test("ready waits for an executing alarm then swaps without waiting for HTTP bodies", async () => {
+  const h = harness();
+  h.facet.fetch = async () => new Response(new ReadableStream());
+  const response = await h.fetch("/stream");
+  let finish!: () => void;
+  h.facet.dispatchAlarm.mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  await h.supervisor.setAlarm("app", Date.now() - 1);
+  const delivery = h.supervisor.alarm();
+  await vi.waitFor(() => assert(finish));
+  h.env.latest = hash(2);
+  await h.supervisor.pending(hash(2));
+  h.supervisor.ready("app");
+  assert.equal((await h.status()).current!.hash, hash(1));
+  assert.equal(h.ctx.facets.abort.mock.calls.length, 0);
+  finish();
+  await delivery;
+  assert.equal((await h.status()).current!.hash, hash(2));
+  assert.equal((await h.swaps())[0].forced, false);
+  assert.equal((await h.swaps())[0].abortedStreams, 0);
+  await response.body!.cancel();
+});
+
+test("scope drains wait for alarm delivery even after explicit readiness", async () => {
+  const h = harness();
+  let finish!: () => void;
+  h.facet.dispatchAlarm.mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  await h.supervisor.setAlarm("app", Date.now() - 1);
+  const delivery = h.supervisor.alarm();
+  await vi.waitFor(() => assert(finish));
+  await h.fetch("/__scope", { method: "PUT", body: '{"readOnly":true}' });
+  h.supervisor.ready("app");
+  assert.equal((await h.status()).current!.readOnly, false);
+  assert.equal(h.ctx.facets.abort.mock.calls.length, 0);
+  finish();
+  await delivery;
+  await vi.waitFor(async () => assert.equal((await h.status()).current!.readOnly, true));
+});
+
+test("non-increasing publications cannot replace a newer pending or committed generation", async () => {
+  const h = harness();
+  h.facet.fetch = async () => new Response(new ReadableStream());
+  const response = await h.fetch("/stream");
+  h.env.latest = hash(3);
+  await h.supervisor.pending(h.env.latest);
+  assert.equal((await h.fetch("/version")).status, 503);
+  assert.equal((await h.status()).pending!.generation, 3);
+  for (const generation of [2, 3]) {
+    h.env.latest = hash(2);
+    h.env.generation = generation;
+    await h.supervisor.pending(h.env.latest);
+    assert.equal((await h.status()).pending!.hash, hash(3));
+  }
+  await response.body!.cancel();
+  h.supervisor.ready("app");
+  assert.equal((await h.status()).current!.generation, 3);
+  const restarted = h.create();
+  await h.fetch("/version", { method: "HEAD" }, restarted);
+  assert.equal((await h.status(restarted)).current!.hash, hash(3));
+  assert.equal(h.env.CODE.get.mock.calls.length, 1);
+  const scoped = await h.fetch(
+    "/__scope",
+    {
+      method: "PUT",
+      body: '{"readOnly":true}',
+    },
+    restarted,
+  );
+  assert.equal(scoped.status, 200);
+  assert.equal((await h.status(restarted)).current!.generation, 3);
+});
+
+function register(
+  h: ReturnType<typeof harness>,
+  name: string,
+  loadedHash: string | null = hash(1),
+) {
+  h.storage.sql.exec(
+    "INSERT INTO facets (name, createdAt, loadedHash, loadedAt) VALUES (?, 1, ?, 1)",
+    name,
+    loadedHash,
+  );
+}
+
+test("ready swaps only its facet; admission reopens there while the deadline forces the other", async () => {
+  vi.useFakeTimers();
+  const h = harness();
+  register(h, "other");
+  register(h, "unloaded", null);
+  h.env.latest = hash(2);
+  await h.supervisor.pending(hash(2));
+  h.supervisor.ready("unloaded");
+  h.supervisor.ready("app");
+  assert.deepEqual(
+    h.ctx.facets.abort.mock.calls.map(([name]) => name),
+    ["app"],
+  );
+  assert.equal((await h.status()).pending!.hash, hash(2));
+  assert.equal(h.supervisor["needsSwap"]("other"), true);
+  const response = await h.fetch("/version");
+  assert.equal(response.status, 200);
+  await response.body?.cancel();
+  assert.equal(h.supervisor["loaded"]("app")!.loadedHash, hash(2));
+  await vi.advanceTimersByTimeAsync(3000);
+  assert.deepEqual(
+    h.ctx.facets.abort.mock.calls.map(([name]) => name),
+    ["app", "other"],
+  );
+  assert.equal((await h.status()).pending, null);
+  assert.deepEqual(
+    (await h.swaps()).map(({ facet, forced }) => ({ facet, forced })),
+    [
+      { facet: "other", forced: true },
+      { facet: "app", forced: false },
+    ],
+  );
+});
+
+test("new facets load the pending target and are not aborted at the shared deadline", async () => {
+  vi.useFakeTimers();
+  const h = harness();
+  h.env.latest = hash(2);
+  await h.supervisor.pending(hash(2));
+  h.supervisor["facet"]("new");
+  assert.equal(h.supervisor["loaded"]("new")!.loadedHash, hash(2));
+  assert.equal(h.supervisor["needsSwap"]("new"), false);
+  await vi.advanceTimersByTimeAsync(3000);
+  assert.deepEqual(
+    h.ctx.facets.abort.mock.calls.map(([name]) => name),
+    ["app"],
+  );
+});
+
+test("an alarm gates only its own facet's readiness", async () => {
+  const h = harness();
+  register(h, "other");
+  let finish!: () => void;
+  h.facet.dispatchAlarm.mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+  );
+  await h.supervisor.setAlarm("app", Date.now() - 1);
+  const delivery = h.supervisor.alarm();
+  await vi.waitFor(() => assert(finish));
+  h.env.latest = hash(2);
+  await h.supervisor.pending(hash(2));
+  h.supervisor.ready("app");
+  h.supervisor.ready("other");
+  assert.deepEqual(
+    h.ctx.facets.abort.mock.calls.map(([name]) => name),
+    ["other"],
+  );
+  finish();
+  await delivery;
+  assert.deepEqual(
+    h.ctx.facets.abort.mock.calls.map(([name]) => name),
+    ["other", "app"],
+  );
+  assert.equal((await h.status()).pending, null);
+});
+
+test("forced cuts end only streams belonging to old facets", async () => {
+  vi.useFakeTimers();
+  const h = harness();
+  register(h, "other");
+  h.facet.fetch = async () =>
+    new Response(new ReadableStream(), { headers: { "content-type": "text/event-stream" } });
+  const old = await h.supervisor["serve"](new Request("http://local/stream"), "other");
+  const oldDone = old.text();
+  h.env.latest = hash(2);
+  await h.supervisor.pending(hash(2));
+  h.supervisor.ready("app");
+  const fresh = await h.fetch("/stream");
+  const reader = fresh.body!.getReader();
+  await vi.advanceTimersByTimeAsync(3000);
+  assert.match(await oldDone, /update-abort/);
+  assert.equal((await h.status()).inflight, 1);
+  assert.equal((await h.swaps())[0].abortedStreams, 1);
+  await reader.cancel();
+  assert.equal((await h.status()).inflight, 0);
+});
+
+test("scope updates drain all facets' admitted work before changing props", async () => {
+  const h = harness();
+  register(h, "other");
+  const { release } = h.supervisor["beginWork"]("other");
+  await h.fetch("/__scope", { method: "PUT", body: '{"readOnly":true}' });
+  h.supervisor.ready("app");
+  h.supervisor.ready("other");
+  assert.equal(h.ctx.facets.abort.mock.calls.length, 0);
+  assert.equal((await h.fetch("/version")).status, 503);
+  release();
+  await vi.waitFor(() =>
+    assert.deepEqual(h.ctx.facets.abort.mock.calls.map(([name]) => name).sort(), ["app", "other"]),
+  );
+  assert.equal((await h.status()).current!.readOnly, true);
+});
+
+test("pending old facets do not block alarm deliveries to updated facets", async () => {
+  const h = harness();
+  register(h, "other");
+  h.env.latest = hash(2);
+  await h.supervisor.pending(hash(2));
+  h.supervisor.ready("app");
+  await h.supervisor.setAlarm("app", Date.now() - 1);
+  await h.supervisor.setAlarm("other", Date.now() - 1);
+  await h.supervisor.alarm();
+  assert.equal(h.facet.dispatchAlarm.mock.calls.length, 1);
+  assert.equal(h.supervisor.getAlarm("app"), null);
+  assert.notEqual(h.supervisor.getAlarm("other"), null);
+  assert(h.native()! > Date.now());
+  h.supervisor.ready("other");
+});
+
+test("forced swaps bound socket cleanup and abort even when its RPC hangs or fails", async () => {
+  vi.useFakeTimers();
+  const h = harness();
+  h.facet.closeSockets.mockImplementationOnce(() => new Promise(() => {}));
+  h.env.latest = hash(2);
+  await h.supervisor.pending(hash(2));
+  await vi.advanceTimersByTimeAsync(3000);
+  assert.equal(h.facet.closeSockets.mock.calls.length, 1);
+  assert.equal(h.ctx.facets.abort.mock.calls.length, 0);
+  await vi.advanceTimersByTimeAsync(999);
+  assert.equal(h.ctx.facets.abort.mock.calls.length, 0);
+  await vi.advanceTimersByTimeAsync(1);
+  assert.equal(h.ctx.facets.abort.mock.calls.length, 1);
+  assert.equal((await h.status()).current!.hash, hash(2));
+
+  await h.fetch("/version");
+  h.facet.closeSockets.mockRejectedValueOnce(new Error("facet unavailable"));
+  h.env.latest = hash(3);
+  await h.supervisor.pending(hash(3));
+  await vi.advanceTimersByTimeAsync(3000);
+  assert.equal(h.ctx.facets.abort.mock.calls.length, 2);
+  assert.equal((await h.status()).current!.hash, hash(3));
+});
+
+test("a target replaced during forced socket cleanup still swaps at the deadline", async () => {
+  vi.useFakeTimers();
+  const h = harness();
+  let finish!: () => void;
+  h.facet.closeSockets.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  h.env.latest = hash(2);
+  await h.supervisor.pending(hash(2));
+  await vi.advanceTimersByTimeAsync(3000);
+  h.env.latest = hash(3);
+  await h.supervisor.pending(hash(3));
+  finish();
+  await vi.advanceTimersByTimeAsync(0);
+  assert.equal((await h.status()).current!.hash, hash(3));
+  assert.equal(h.ctx.facets.abort.mock.calls.length, 1);
+  assert.equal((await h.swaps())[0].forced, true);
 });

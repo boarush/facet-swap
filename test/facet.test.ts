@@ -68,9 +68,17 @@ type Alarm = {
 };
 
 async function get<T = Version>(path: string): Promise<T> {
-  const response = await fetch(base + path);
-  assert.equal(response.status, 200, await response.clone().text());
-  return response.json<T>();
+  for (let i = 0; i < 100; i++) {
+    const response = await fetch(base + path);
+    if (response.status === 503) {
+      await response.body?.cancel();
+      await delay(20);
+      continue;
+    }
+    assert.equal(response.status, 200, await response.clone().text());
+    return response.json<T>();
+  }
+  throw new Error("Admission stayed closed: " + path);
 }
 async function until(fn: () => Promise<boolean>) {
   const end = Date.now() + 10000;
@@ -88,7 +96,12 @@ function stream(user: string, n: number, ms: number, expectAbort = false) {
     rejectStarted = reject;
   });
   const done = (async () => {
-    const response = await fetch(base + "/u/" + user + "/stream?n=" + n + "&ms=" + ms);
+    let response = await fetch(base + "/u/" + user + "/stream?n=" + n + "&ms=" + ms);
+    for (let i = 0; response.status === 503 && i < 100; i++) {
+      await response.body?.cancel();
+      await delay(20);
+      response = await fetch(base + "/u/" + user + "/stream?n=" + n + "&ms=" + ms);
+    }
     assert.equal(response.status, 200);
     const events: StreamEvent[] = [];
     let updateAbort: UpdateAbort | undefined;
@@ -170,6 +183,61 @@ test.provider(
         assert.equal(initial.v, unlabelled.slice(0, 12));
         assert.equal(Object.hasOwn(initial, "label"), false);
         pass("no manual label needed; clients see a short content hash");
+
+        const socketUser = "socket_" + process.pid;
+        const socket = new WebSocket(base.replace("http:", "ws:") + "/u/" + socketUser + "/ws");
+        const messages: { type?: string; hash: string; message?: string }[] = [];
+        socket.addEventListener("message", (event) =>
+          messages.push(JSON.parse(String(event.data))),
+        );
+        await new Promise<void>((resolve, reject) => {
+          socket.addEventListener("open", () => resolve(), { once: true });
+          socket.addEventListener("error", reject, { once: true });
+        });
+        await until(async () => messages.length === 1);
+        assert.deepEqual(messages[0], { type: "swap-resumed", hash: unlabelled });
+        socket.send("hello");
+        await until(async () => messages.length === 2);
+        assert.deepEqual(messages[1], { hash: unlabelled, message: "hello" });
+        assert.equal((await get<Status>("/u/" + socketUser + "/__status")).inflight, 0);
+        const closed = new Promise<number>((resolve) =>
+          socket.addEventListener("close", (event) => resolve(event.code), { once: true }),
+        );
+        const socketHash = await deploy("socket-next");
+        socket.send("detect");
+        const closeCode = await Promise.race([
+          closed,
+          delay(10000).then(() => {
+            throw new Error("Readiness did not close socket");
+          }),
+        ]);
+        assert.equal(closeCode, 1012);
+        assert(
+          messages.some(
+            (message) => message.type === "swap-pending" && message.hash === socketHash,
+          ),
+        );
+        assert.equal(
+          (await get<Status>("/u/" + socketUser + "/__status")).current!.hash,
+          socketHash,
+        );
+        const reconnected = new WebSocket(
+          base.replace("http:", "ws:") + "/u/" + socketUser + "/ws",
+        );
+        const resumed = await new Promise<{ hash: string }>((resolve, reject) => {
+          reconnected.addEventListener(
+            "message",
+            (event) => resolve(JSON.parse(String(event.data))),
+            { once: true },
+          );
+          reconnected.addEventListener("error", reject, { once: true });
+        });
+        assert.equal(resumed.hash, socketHash);
+        reconnected.close();
+        await deploy("");
+        pass(
+          "socket passthrough echoes, detects updates, closes with 1012 and reconnects on new code",
+        );
 
         const diagnosticUser = "/u/unlabelled_" + process.pid;
         for (const path of [
@@ -412,12 +480,21 @@ test.provider(
         await scope(a, false);
         assert.equal((await note(a, "secret", "alice writable again")).status, 200);
         pass("same-version scope swap drains before read-only enforcement; other users unaffected");
+        const forcedSocket = new WebSocket(base.replace("http:", "ws:") + "/u/" + a + "/ws");
+        await new Promise<void>((resolve, reject) => {
+          forcedSocket.addEventListener("message", () => resolve(), { once: true });
+          forcedSocket.addEventListener("error", reject, { once: true });
+        });
+        const forcedClose = new Promise<number>((resolve) =>
+          forcedSocket.addEventListener("close", (event) => resolve(event.code), { once: true }),
+        );
         const overdue = stream(a, 100, 1000, true);
         await overdue.started;
         const v4 = await deploy("v4", "g2");
         const pendingAt = Date.now();
         await rejectedDuringDrain("/u/" + a + "/version", v3, v4);
         const forced = await overdue.done;
+        assert.equal(await Promise.race([forcedClose, delay(10000).then(() => null)]), 1012);
         assert.deepEqual(forced.updateAbort, {
           reason: "drain-deadline",
           oldVersion: v3,
@@ -505,16 +582,20 @@ test.provider(
         await schedule(Date.now() + 2000);
         const v5 = await deploy("v5", "g2");
         await delay(2200);
+        // Native alarm delivery does not poll for updates; a request discovers v5.
+        await get("/u/" + alarmUser + "/version");
         await until(async () => (await get<Alarm>(alarmPath)).count === 4);
         assert.deepEqual((await get<Alarm>(alarmPath)).last, {
-          hash: v5,
+          hash: v4,
           type: "reminder",
           payload: { text: "test" },
         });
         assert.deepEqual((await get<Alarm>(alarmPath)).alarms, []);
-        pass("queued entry survives swap and wakes latest code without traffic");
+        pass(
+          "alarm delivery keeps current code without traffic; the next request detects publication",
+        );
 
-        await schedule(Date.now() + 1000);
+        await schedule(Date.now() + 2000);
         const alarmDrain = stream(alarmUser, 25, 100);
         await alarmDrain.started;
         const v6 = await deploy("v6", "g2");
@@ -536,6 +617,7 @@ test.provider(
             ),
           );
           const retryHash = await deploy("alarm-retry", "g2");
+          await get("/u/" + alarmUser + "/version");
           await schedule(Date.now() + 100);
           await until(async () => (await get<Alarm>(alarmPath)).count === 6);
           assert.equal((await get<Alarm>(alarmPath)).last!.hash, retryHash);

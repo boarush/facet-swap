@@ -4,11 +4,14 @@ import { Alarms } from "./alarms";
 import { isDenied, type NotesScope, type ScopedNotes } from "./notes";
 import { createRouter } from "./router";
 import type { Scheduler } from "./scheduler";
+import { trackResponseBody } from "./stream-lifetime";
+import { FacetUpdates, type UpdateEnv } from "./updates";
 
 declare const VERSION: string;
 
-type AppEnv = {
+type AppEnv = UpdateEnv & {
   HASH: string;
+  CHECK_INTERVAL_MS: string;
   NOTES: Service<ScopedNotes>;
   SCHEDULER: Service<Scheduler>;
 };
@@ -16,6 +19,63 @@ type AppEnv = {
 type AppProps = NotesScope & { facet: string };
 
 export class App extends DurableObject<AppEnv, AppProps> {
+  private work = 0;
+  private updating?: string;
+  private readonly updates = new FacetUpdates(
+    this.env,
+    this.ctx.props,
+    this.env.HASH,
+    Number(this.env.CHECK_INTERVAL_MS),
+    (hash) => this.onUpdate(hash),
+    this.ctx,
+  );
+
+  closeSockets(): void {
+    this.updates.closeSockets();
+  }
+
+  private onUpdate(hash: string): void {
+    this.updating = hash;
+    for (const socket of this.ctx.getWebSockets()) {
+      socket.send(JSON.stringify({ type: "swap-pending", hash }));
+    }
+    this.readyWhenIdle();
+  }
+
+  private readyWhenIdle(): void {
+    if (this.updating && this.work === 0) this.ctx.waitUntil(this.updates.ready());
+  }
+
+  private beginWork(): () => void {
+    this.work++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.work--;
+      this.readyWhenIdle();
+    };
+  }
+
+  async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    const release = this.beginWork();
+    try {
+      await this.updates.check();
+      socket.send(
+        JSON.stringify({
+          hash: this.env.HASH,
+          message: typeof message === "string" ? message : Array.from(new Uint8Array(message)),
+        }),
+      );
+    } finally {
+      release();
+    }
+  }
+
+  webSocketClose(socket: WebSocket, code: number, reason: string): void {
+    socket.close(code, reason);
+  }
+
   // Native event names cannot be invoked through a DurableObject RPC stub.
   dispatchAlarm(info?: AlarmInvocationInfo): Promise<void> {
     return this.alarm(info);
@@ -39,10 +99,24 @@ export class App extends DurableObject<AppEnv, AppProps> {
   }
 
   async alarm(_info?: AlarmInvocationInfo): Promise<void> {
-    await this.alarms.run();
+    const release = this.beginWork();
+    try {
+      await this.alarms.run();
+    } finally {
+      release();
+    }
   }
 
   private readonly router = createRouter<AppEnv>()
+    .get("/ws", (c) => {
+      if (c.req.header("Upgrade")?.toLowerCase() !== "websocket")
+        return new Response("Expected WebSocket", { status: 426 });
+      const pair = new WebSocketPair();
+      this.ctx.acceptWebSocket(pair[1]);
+      pair[1].send(JSON.stringify({ type: "swap-resumed", hash: this.env.HASH }));
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    })
+    .all("/ws", () => new Response("Method not allowed", { status: 405 }))
     .get("/version", (c) =>
       Response.json({
         v: c.env.HASH.slice(0, 12),
@@ -131,7 +205,32 @@ export class App extends DurableObject<AppEnv, AppProps> {
     .all("/stream", () => new Response("Method not allowed", { status: 405 }));
 
   async fetch(request: Request): Promise<Response> {
-    return this.router.fetch(request, this.env);
+    const release = this.beginWork();
+    try {
+      await this.updates.check();
+      if (this.updating) {
+        release();
+        return new Response("Update pending; retry later", {
+          status: 503,
+          headers: {
+            "Retry-After": "1",
+            "X-Current-Version": this.env.HASH,
+            "X-Pending-Version": this.updating,
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+      const response = await this.router.fetch(request, this.env);
+      if (response.status === 101) {
+        release();
+        return response;
+      }
+      // Demo work includes stream lifetime, not idle sockets.
+      return trackResponseBody(response, new AbortController().signal, release);
+    } catch (error) {
+      release();
+      throw error;
+    }
   }
 
   private stream(count: number, intervalMs: number, served: number): Response {

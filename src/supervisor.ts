@@ -4,7 +4,7 @@ import type { Env } from "../alchemy.run";
 
 import { createRouter } from "./router";
 import { trackResponseBody, type UpdateAbort } from "./stream-lifetime";
-import { loadApp, VersionSource } from "./version-source";
+import { loadApp } from "./version-source";
 
 type ScheduledAlarm = { name: string; time: number; token: string };
 
@@ -16,6 +16,7 @@ type VersionState = {
 };
 type SwapRow = {
   id: number;
+  facet: string | null;
   oldHash: string | null;
   newHash: string;
   kind: "code" | "scope";
@@ -30,32 +31,34 @@ type SwapRow = {
 export class Supervisor extends DurableObject<Env> {
   private state: VersionState;
   private swapping = false;
+  private forceRequested = false;
+  private bootstrapRead?: Promise<void>;
+  private readonly restoring: Promise<void>;
+  private readonly readyRequested = new Set<string>();
   private readonly runningAlarms = new Map<string, string>();
-  private readonly active = new Set<AbortController>();
+  private readonly active = new Map<AbortController, string>();
   private readonly streams = new Set<AbortController>();
   private drainTimer?: ReturnType<typeof setTimeout>;
-  private readonly versions: VersionSource;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.versions = new VersionSource(env);
     this.state = ctx.storage.kv.get<VersionState>("app-config") ?? { current: null, pending: null };
     ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS swaps (
         id INTEGER PRIMARY KEY,
-        oldHash TEXT, newHash TEXT NOT NULL, kind TEXT NOT NULL,
+        facet TEXT, oldHash TEXT, newHash TEXT NOT NULL, kind TEXT NOT NULL,
         pendingSince INTEGER NOT NULL, swappedAt INTEGER NOT NULL,
         forced INTEGER NOT NULL, abortedStreams INTEGER NOT NULL, restartCommit INTEGER NOT NULL
       )
     `);
     ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS facets (
-        name TEXT PRIMARY KEY, createdAt INTEGER NOT NULL, loadedHash TEXT NOT NULL, loadedAt INTEGER NOT NULL,
+        name TEXT PRIMARY KEY, createdAt INTEGER NOT NULL, loadedHash TEXT, loadedAt INTEGER NOT NULL, loadedReadOnly INTEGER NOT NULL DEFAULT 0,
         alarmTime INTEGER, alarmToken TEXT
       )
     `);
     // Inflight tracking cannot survive restart; finish any persisted pending swap on wake.
-    this.swap(false, true);
+    this.restoring = this.swap(false, true);
   }
 
   private readonly router = createRouter<Env>()
@@ -80,10 +83,6 @@ export class Supervisor extends DurableObject<Env> {
       });
     })
     .all("/__status", () => new Response("Method not allowed", { status: 405 }))
-    .use(async (_c, next) => {
-      await this.checkForUpdate();
-      await next();
-    })
     // Local trusted control plane only; never forward scope requests to the facet.
     .put("/__scope", async (c) => {
       const body = await c.req.raw.json<{ readOnly?: unknown }>();
@@ -99,13 +98,13 @@ export class Supervisor extends DurableObject<Env> {
     .all("/__scope", () => new Response("Method not allowed", { status: 405 }))
     .all("*", (c) => {
       // Clients own retries; never retain requests while old bodies drain.
-      if (this.state.pending) {
+      if (this.needsSwap("app")) {
         return new Response("Update pending; retry later", {
           status: 503,
           headers: {
             "Retry-After": "1",
-            "X-Current-Version": this.state.current?.hash ?? "",
-            "X-Pending-Version": this.state.pending.hash,
+            "X-Current-Version": this.loaded("app")?.loadedHash ?? "",
+            "X-Pending-Version": this.state.pending!.hash,
             "Cache-Control": "no-store",
           },
         });
@@ -115,6 +114,8 @@ export class Supervisor extends DurableObject<Env> {
     });
 
   async fetch(request: Request): Promise<Response> {
+    await this.restoring;
+    if (new URL(request.url).pathname !== "/__status") await this.bootstrap();
     return this.router.fetch(request, this.env);
   }
 
@@ -155,20 +156,24 @@ export class Supervisor extends DurableObject<Env> {
   private async rearm(retrying = false): Promise<void> {
     // Delivery rearms once after all handlers, preserving native retry metadata on failure.
     if (this.runningAlarms.size) return;
-    const [{ time }] = this.ctx.storage.sql
-      .exec<{ time: number | null }>("SELECT MIN(alarmTime) AS time FROM facets")
+    const scheduled = this.ctx.storage.sql
+      .exec<{ name: string; time: number }>(
+        "SELECT name, alarmTime AS time FROM facets WHERE alarmTime IS NOT NULL",
+      )
       .toArray();
-    // Replacing an overdue native alarm resets its retry metadata. Let the throw retry it.
-    if (retrying && time !== null && time <= Date.now() && !this.state.pending) return;
+    const times = scheduled.map(({ name, time }) =>
+      this.needsSwap(name) ? Math.max(time, Date.now() + 2000) : time,
+    );
+    const time = times.length ? Math.min(...times) : null;
+    // Leave an overdue, deliverable failed alarm to native retry to preserve metadata.
+    if (retrying && time !== null && time <= Date.now()) return;
     if (time === null) await this.ctx.storage.deleteAlarm();
-    else
-      await this.ctx.storage.setAlarm(
-        this.state.pending ? Math.max(time, Date.now() + 2000) : time,
-      );
+    else await this.ctx.storage.setAlarm(time);
   }
 
   async alarm(info?: AlarmInvocationInfo): Promise<void> {
-    await this.checkForUpdate();
+    await this.restoring;
+    await this.bootstrap();
     const due = this.ctx.storage.sql
       .exec<ScheduledAlarm>(
         "SELECT name, alarmTime AS time, alarmToken AS token FROM facets WHERE alarmTime <= ? ORDER BY alarmTime, name",
@@ -177,7 +182,7 @@ export class Supervisor extends DurableObject<Env> {
       .toArray();
     const failures: unknown[] = [];
     for (const scheduled of due) {
-      if (this.state.pending) break;
+      if (this.needsSwap(scheduled.name)) continue;
       // A preceding handler may cancel or replace another facet's wake-up.
       const [current] = this.ctx.storage.sql
         .exec<{ token: string | null }>(
@@ -187,7 +192,7 @@ export class Supervisor extends DurableObject<Env> {
         .toArray();
       if (current?.token !== scheduled.token) continue;
       if (!this.state.current) throw new Error("Publish a version first");
-      const { release } = this.beginWork();
+      const { release } = this.beginWork(scheduled.name);
       this.runningAlarms.set(scheduled.name, scheduled.token);
       try {
         // 'alarm' is reserved on DO RPC; copy the runtime's non-serializable metadata.
@@ -216,49 +221,80 @@ export class Supervisor extends DurableObject<Env> {
     if (failures.length) throw failures[0];
   }
 
-  private checkForUpdate(): Promise<void> {
-    return this.versions.check(async (latest) => {
-      if (latest === null || latest === undefined) return;
-      let config: AppConfig;
-      try {
-        if (
-          typeof latest !== "object" ||
-          !("hash" in latest) ||
-          typeof latest.hash !== "string" ||
-          !/^[0-9a-f]{64}$/.test(latest.hash) ||
-          !("generation" in latest) ||
-          typeof latest.generation !== "number" ||
-          !Number.isSafeInteger(latest.generation) ||
-          latest.generation < 1
-        )
-          throw new Error("Invalid facet publication");
-        const highest = Math.max(
-          this.state.current?.generation ?? 0,
-          this.state.pending?.generation ?? 0,
-        );
-        if (latest.generation <= highest) return;
-        const scope = {
-          supervisorId: this.ctx.id.toString(),
-          readOnly: this.target()?.readOnly ?? false,
-        };
-        await loadApp(this.env, latest.hash, scope, "app", true);
-        // A scope change may land during preflight; never stage the stale permission.
-        // The module is already validated, so the facet receives its current scope through props.
-        const readOnly = this.target()?.readOnly ?? false;
-        config = { hash: latest.hash, generation: latest.generation, readOnly };
-      } catch (error) {
-        console.error("Facet preflight failed; keeping current configuration", latest, error);
-        return;
-      }
-      const target = this.target();
-      if (target?.hash === config.hash) {
-        // A forced republication of identical code advances ordering, not the drain.
-        target.generation = config.generation;
-        this.ctx.storage.kv.put("app-config", this.state);
-      } else {
-        this.stage(config);
-      }
+  async pending(hash: string): Promise<boolean> {
+    if (typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash)) return false;
+    const latest: unknown = await this.env.VERSIONS.get("latest", "json");
+    return this.acceptPublication(hash, latest);
+  }
+
+  private async bootstrap(): Promise<void> {
+    if (this.state.current) return;
+    this.bootstrapRead ??= (async () => {
+      const latest: unknown = await this.env.VERSIONS.get("latest", "json");
+      if (
+        latest &&
+        typeof latest === "object" &&
+        "hash" in latest &&
+        typeof latest.hash === "string"
+      )
+        await this.acceptPublication(latest.hash, latest);
+    })().finally(() => {
+      this.bootstrapRead = undefined;
     });
+    await this.bootstrapRead;
+  }
+
+  private async acceptPublication(hash: string, latest: unknown): Promise<boolean> {
+    if (latest === null || latest === undefined) return false;
+    let config: AppConfig;
+    try {
+      if (
+        typeof latest !== "object" ||
+        !("hash" in latest) ||
+        typeof latest.hash !== "string" ||
+        !/^[0-9a-f]{64}$/.test(latest.hash) ||
+        !("generation" in latest) ||
+        typeof latest.generation !== "number" ||
+        !Number.isSafeInteger(latest.generation) ||
+        latest.generation < 1
+      )
+        throw new Error("Invalid facet publication");
+      if (latest.hash !== hash) throw new Error("Unpublished facet hash");
+      const highest = Math.max(
+        this.state.current?.generation ?? 0,
+        this.state.pending?.generation ?? 0,
+      );
+      if (latest.generation <= highest) return this.state.pending?.hash === hash;
+      const scope = {
+        supervisorId: this.ctx.id.toString(),
+        readOnly: this.target()?.readOnly ?? false,
+      };
+      await loadApp(this.env, latest.hash, scope, "app", true);
+      // A scope change may land during preflight; never stage the stale permission.
+      // The module is already validated, so the facet receives its current scope through props.
+      const readOnly = this.target()?.readOnly ?? false;
+      config = { hash: latest.hash, generation: latest.generation, readOnly };
+    } catch (error) {
+      console.error("Facet preflight failed; keeping current configuration", latest, error);
+      return false;
+    }
+    const target = this.target();
+    // Another facet may finish a newer preflight while this one awaits code.
+    if (config.generation <= (target?.generation ?? 0)) return this.state.pending?.hash === hash;
+    if (target?.hash === config.hash) {
+      // A forced republication of identical code advances ordering, not the drain.
+      target.generation = config.generation;
+      this.ctx.storage.kv.put("app-config", this.state);
+    } else {
+      this.stage(config);
+    }
+    return this.state.pending?.hash === hash;
+  }
+
+  ready(facet: string): void {
+    if (!this.needsSwap(facet)) return;
+    this.readyRequested.add(facet);
+    void this.swap();
   }
 
   // The configuration the next swap lands on.
@@ -267,64 +303,123 @@ export class Supervisor extends DurableObject<Env> {
   }
 
   private stage(config: AppConfig): void {
+    if (this.state.pending?.hash !== config.hash) this.readyRequested.clear();
     this.state.pendingSince ??= Date.now();
     this.state.pending = config;
     this.ctx.storage.kv.put("app-config", this.state);
     // Replacing pending code/scope never extends an already-running deadline.
     if (this.drainTimer === undefined) {
       // Active timers prevent DO hibernation; no durable alarm is needed for live bodies.
-      this.drainTimer = setTimeout(() => this.swap(true), Number(this.env.DRAIN_DEADLINE_MS));
+      this.drainTimer = setTimeout(() => void this.swap(true), Number(this.env.DRAIN_DEADLINE_MS));
     }
-    this.swapWhenIdle();
+    void this.swap();
   }
 
-  private swapWhenIdle(): void {
-    if (this.active.size === 0) this.swap();
+  private loaded(name: string) {
+    return this.ctx.storage.sql
+      .exec<{ name: string; loadedHash: string | null; loadedReadOnly: number }>(
+        "SELECT name, loadedHash, loadedReadOnly FROM facets WHERE name = ?",
+        name,
+      )
+      .toArray()[0];
   }
 
-  private swap(force = false, restartCommit = false): void {
-    if (this.swapping || !this.state.pending || (!force && this.active.size !== 0)) return;
+  private needsSwap(name: string): boolean {
+    const loaded = this.loaded(name);
+    const target = this.state.pending;
+    return !!(
+      target &&
+      loaded?.loadedHash &&
+      (loaded.loadedHash !== target.hash || !!loaded.loadedReadOnly !== target.readOnly)
+    );
+  }
+
+  private async swap(force = false, restartCommit = false): Promise<void> {
+    if (this.swapping) {
+      this.forceRequested ||= force;
+      return;
+    }
+    if (!this.state.pending) return;
+    const scopeChange = this.ctx.storage.sql
+      .exec<{ loadedReadOnly: number }>(
+        "SELECT loadedReadOnly FROM facets WHERE loadedHash IS NOT NULL",
+      )
+      .toArray()
+      .some((row) => !!row.loadedReadOnly !== this.state.pending!.readOnly);
+    // Props changes remain an object-wide admission drain.
+    if (!force && !restartCommit && scopeChange && this.active.size) return;
     this.swapping = true;
+    const originalTarget = this.state.pending;
     try {
-      clearTimeout(this.drainTimer);
-      this.drainTimer = undefined;
-      const reason: UpdateAbort = {
-        reason: "drain-deadline",
-        oldVersion: this.state.current?.hash ?? "",
-        newVersion: this.state.pending.hash,
-      };
+      const target = this.state.pending;
+      const facets = this.ctx.storage.sql
+        .exec<{ name: string }>("SELECT name FROM facets")
+        .toArray()
+        .filter(({ name }) => this.needsSwap(name));
+      const selected = facets.filter(
+        ({ name }) =>
+          force ||
+          restartCommit ||
+          (scopeChange && !this.active.size) ||
+          (this.readyRequested.has(name) && !this.runningAlarms.has(name)),
+      );
+      if (selected.length && (force || scopeChange || restartCommit)) {
+        await Promise.all(selected.map(({ name }) => this.closeSockets(name)));
+        // A newer publication or scope may arrive while the close RPC is in flight.
+        if (this.state.pending !== target) return;
+      }
       const swappedAt = Date.now();
-      const next = { current: this.state.pending, pending: null };
-      // Commit history with current atomically; restart must not lose or duplicate a row.
       this.ctx.storage.transactionSync(() => {
-        this.ctx.storage.kv.put("app-config", next);
-        this.ctx.storage.sql.exec(
-          `INSERT INTO swaps
-            (oldHash, newHash, kind, pendingSince, swappedAt, forced, abortedStreams, restartCommit)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          this.state.current?.hash ?? null,
-          next.current.hash,
-          this.state.current?.hash === next.current.hash ? "scope" : "code",
-          this.state.pendingSince ?? swappedAt,
-          swappedAt,
-          Number(force),
-          force ? this.streams.size : 0,
-          Number(restartCommit),
-        );
+        const record = (name: string | null, oldHash: string | null, abortedStreams: number) => {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO swaps
+              (facet, oldHash, newHash, kind, pendingSince, swappedAt, forced, abortedStreams, restartCommit)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            name,
+            oldHash,
+            target.hash,
+            oldHash === target.hash ? "scope" : "code",
+            this.state.pendingSince ?? swappedAt,
+            swappedAt,
+            Number(force),
+            abortedStreams,
+            Number(restartCommit),
+          );
+        };
+        for (const { name } of selected) {
+          const oldHash = this.loaded(name)!.loadedHash!;
+          const controllers = [...this.active]
+            .filter(([, facet]) => facet === name)
+            .map(([controller]) => controller);
+          record(name, oldHash, force ? controllers.filter((c) => this.streams.has(c)).length : 0);
+          if (force) {
+            const reason: UpdateAbort = {
+              reason: "drain-deadline",
+              oldVersion: oldHash,
+              newVersion: target.hash,
+            };
+            for (const controller of controllers) {
+              controller.abort(reason);
+              this.active.delete(controller);
+            }
+          }
+          // Null marks an aborted, not-yet-instantiated facet. Its next load uses the target.
+          this.ctx.storage.sql.exec("UPDATE facets SET loadedHash = NULL WHERE name = ?", name);
+          this.readyRequested.delete(name);
+        }
+        if (!this.state.current) record(null, null, 0);
+        if (selected.length === facets.length) {
+          this.state = { current: target, pending: null };
+          clearTimeout(this.drainTimer);
+          this.drainTimer = undefined;
+          this.readyRequested.clear();
+        }
+        this.ctx.storage.kv.put("app-config", this.state);
         this.ctx.storage.sql.exec(
           "DELETE FROM swaps WHERE id NOT IN (SELECT id FROM swaps ORDER BY id DESC LIMIT 100)",
         );
       });
-      this.state = next;
-      // Finish Supervisor-owned SSE bodies before aborting their facet source.
-      if (force) {
-        for (const controller of this.active) controller.abort(reason);
-        this.active.clear();
-      }
-      // Abort restarts facet code but preserves its SQLite storage.
-      for (const { name } of this.ctx.storage.sql
-        .exec<{ name: string }>("SELECT name FROM facets")
-        .toArray()) {
+      for (const { name } of selected) {
         this.ctx.facets.abort(
           name,
           new Error(force ? "Drain deadline exceeded" : "Code or scope updated"),
@@ -332,41 +427,68 @@ export class Supervisor extends DurableObject<Env> {
       }
     } finally {
       this.swapping = false;
+      const forced = this.forceRequested;
+      this.forceRequested = false;
+      if (this.state.pending && (forced || this.state.pending !== originalTarget)) {
+        void this.swap(force || forced);
+      }
+    }
+  }
+
+  private async closeSockets(name: string): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        this.facet(name).closeSockets(),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, 1000);
+        }),
+      ]);
+    } catch {
+      // Closing is best-effort; an unresponsive facet must still be aborted.
+    } finally {
+      clearTimeout(timer);
     }
   }
 
   private facet(name: string) {
-    const { hash, readOnly } = this.state.current!;
+    const { hash, readOnly } = this.target()!;
     const scope = { supervisorId: this.ctx.id.toString(), readOnly };
     return this.ctx.facets.get(name, () => {
       // The callback runs only when the runtime instantiates the facet, so this records real loads.
       this.ctx.storage.sql.exec(
-        `INSERT INTO facets (name, createdAt, loadedHash, loadedAt) VALUES (?, ?, ?, ?)
-          ON CONFLICT (name) DO UPDATE SET loadedHash = excluded.loadedHash, loadedAt = excluded.loadedAt`,
+        `INSERT INTO facets (name, createdAt, loadedHash, loadedAt, loadedReadOnly) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT (name) DO UPDATE SET loadedHash = excluded.loadedHash, loadedAt = excluded.loadedAt, loadedReadOnly = excluded.loadedReadOnly`,
         name,
         Date.now(),
         hash,
         Date.now(),
+        Number(readOnly),
       );
       return loadApp(this.env, hash, scope, name);
     });
   }
 
-  private beginWork() {
+  private beginWork(facet: string) {
     const controller = new AbortController();
-    this.active.add(controller);
+    this.active.set(controller, facet);
     const release = () => {
       // Old header/body completions after a forced swap cannot release new work.
       this.streams.delete(controller);
-      if (this.active.delete(controller)) this.swapWhenIdle();
+      if (this.active.delete(controller)) void this.swap();
     };
     return { controller, release };
   }
 
-  private async serve(request: Request): Promise<Response> {
-    const { controller, release } = this.beginWork();
+  private async serve(request: Request, facet = "app"): Promise<Response> {
+    const { controller, release } = this.beginWork(facet);
     try {
-      const response = await this.facet("app").fetch(request);
+      const response = await this.facet(facet).fetch(request);
+      // A hibernatable socket is not an application operation or a response body.
+      if (response.status === 101) {
+        release();
+        return response;
+      }
       if (response.body && !controller.signal.aborted) this.streams.add(controller);
       return trackResponseBody(response, controller.signal, release);
     } catch (error) {

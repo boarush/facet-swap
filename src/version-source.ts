@@ -7,32 +7,6 @@ import type { NotesScope } from "./notes";
 
 export type Publication = { hash: string; generation: number };
 
-export class VersionSource {
-  private lastCheck = -Infinity;
-  private checking?: Promise<void>;
-
-  constructor(private readonly env: Env) {}
-
-  // Lazy KV checks on requests and application alarms; no background update polling.
-  check(onLatest: (latest: unknown) => void | Promise<void>): Promise<void> {
-    if (this.checking) return this.checking;
-    if (Date.now() - this.lastCheck < Number(this.env.CHECK_INTERVAL_MS)) {
-      return Promise.resolve();
-    }
-    this.lastCheck = Date.now();
-    this.checking = this.env.VERSIONS.get("latest", "json")
-      .catch((error: unknown) => {
-        console.error("Version check failed; keeping current facet", error);
-        return null;
-      })
-      .then(onLatest)
-      .finally(() => {
-        this.checking = undefined;
-      });
-    return this.checking;
-  }
-}
-
 export async function loadApp(
   env: Env,
   hash: string,
@@ -54,6 +28,9 @@ export async function loadApp(
     modules: { "app.js": code ?? (await readCode()) },
     env: {
       HASH: hash,
+      CHECK_INTERVAL_MS: env.CHECK_INTERVAL_MS,
+      VERSIONS: exports.Versions({ props: {} }),
+      SWAP: exports.Swap({ props: {} }),
       NOTES: exports.ScopedNotes({ props: {} }),
       SCHEDULER: exports.Scheduler({ props: {} }),
     },

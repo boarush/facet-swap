@@ -33,6 +33,7 @@ function entry() {
     },
     SUPERVISORS: {
       getByName: (user: string) => ({
+        initialized: async () => true,
         fetch: async (request: Request) => {
           forwarded.push({ user, request });
           return new Response("forwarded", { headers: { "x-test": "untouched" } });
@@ -54,6 +55,8 @@ function facet() {
     HASH: "1234567890abcdef",
   };
   const services = {
+    versions: { latest: async () => null },
+    swap: { pending: async () => false, ready: async () => {} },
     notes: {
       get: vi.fn<(scope: unknown, key: string) => Promise<string>>(async (_scope, key) => key),
       put: vi.fn<(scope: unknown, key: string, value: string) => Promise<void>>(async () => {}),
@@ -65,7 +68,12 @@ function facet() {
       deleteAlarm: vi.fn<(scope: unknown) => Promise<void>>(async () => {}),
     },
   };
-  Object.assign(env, { NOTES: services.notes, SCHEDULER: services.scheduler });
+  Object.assign(env, {
+    VERSIONS: services.versions,
+    SWAP: services.swap,
+    NOTES: services.notes,
+    SCHEDULER: services.scheduler,
+  });
   const props = { supervisorId: "user", readOnly: false, facet: "app" };
   const db = new DatabaseSync(":memory:");
   const app = new App(

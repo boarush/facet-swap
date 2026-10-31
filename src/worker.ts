@@ -5,6 +5,7 @@ import type { Publication } from "./version-source";
 
 export { ScopedNotes } from "./notes";
 export { Scheduler } from "./scheduler";
+export { Versions, Swap } from "./updates";
 export { Supervisor } from "./supervisor";
 
 declare global {
