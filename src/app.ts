@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 import { Alarms } from "./alarms";
-import { isDenied, type ScopedNotes } from "./notes";
+import { isDenied, type NotesScope, type ScopedNotes } from "./notes";
 import { createRouter } from "./router";
 import type { Scheduler } from "./scheduler";
 
@@ -9,12 +9,11 @@ declare const VERSION: string;
 
 type AppEnv = {
   HASH: string;
+  NOTES: Service<ScopedNotes>;
+  SCHEDULER: Service<Scheduler>;
 };
 
-type AppProps = {
-  notes: Service<ScopedNotes>;
-  scheduler: Service<Scheduler>;
-};
+type AppProps = NotesScope & { facet: string };
 
 export class App extends DurableObject<AppEnv, AppProps> {
   // Native event names cannot be invoked through a DurableObject RPC stub.
@@ -22,7 +21,7 @@ export class App extends DurableObject<AppEnv, AppProps> {
     return this.alarm(info);
   }
 
-  private readonly alarms = new Alarms(this.ctx, {
+  private readonly alarms = new Alarms(this.ctx, this.env.SCHEDULER, {
     reminder: async (payload: { text: string }) => {
       this.delivered("reminder", payload);
     },
@@ -93,13 +92,13 @@ export class App extends DurableObject<AppEnv, AppProps> {
       const key = new URL(c.req.url).searchParams.get("key") ?? "note";
       try {
         if (c.req.method === "PUT") {
-          await this.ctx.props.notes.put(key, await c.req.raw.text());
+          await this.env.NOTES.put(this.ctx.props, key, await c.req.raw.text());
         } else if (c.req.method !== "GET") {
           return new Response("Method not allowed", { status: 405 });
         }
         return Response.json({
-          value: await this.ctx.props.notes.get(key),
-          gateway: await this.ctx.props.notes.revision(),
+          value: await this.env.NOTES.get(this.ctx.props, key),
+          gateway: await this.env.NOTES.revision(),
         });
       } catch (error) {
         // Only scope denials are 403; gateway or storage failures propagate as errors.

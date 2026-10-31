@@ -1,12 +1,13 @@
-import type { Scheduler } from "./scheduler";
+import type { AlarmScope, Scheduler } from "./scheduler";
 
 type Handler = (payload: never) => Promise<void>;
 type Row = { id: number; type: string; time: number; payload: string; attempts: number };
-type Context = Pick<DurableObjectState<{ scheduler: Service<Scheduler> }>, "storage" | "props">;
+type Context = Pick<DurableObjectState<AlarmScope>, "storage" | "props">;
 
 export class Alarms<H extends Record<string, Handler>> {
   constructor(
     private readonly ctx: Context,
+    private readonly scheduler: Service<Scheduler>,
     private readonly handlers: H,
   ) {
     ctx.storage.sql.exec(`
@@ -95,7 +96,7 @@ export class Alarms<H extends Record<string, Handler>> {
     const { time } = this.ctx.storage.sql
       .exec<{ time: number | null }>("SELECT MIN(time) AS time FROM alarms")
       .one();
-    if (time === null) await this.ctx.props.scheduler.deleteAlarm();
-    else await this.ctx.props.scheduler.setAlarm(time);
+    if (time === null) await this.scheduler.deleteAlarm(this.ctx.props);
+    else await this.scheduler.setAlarm(this.ctx.props, time);
   }
 }

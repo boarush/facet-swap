@@ -47,12 +47,16 @@ export async function loadApp(
   };
   // Don't cache a failed R2 read in the loader: a later check must be able to retry.
   const code = preflight ? await readCode() : undefined;
-  // Only code-level data belongs in the hash-shared loader environment.
+  // Production rejects stub-valued DO class props. Trusted facets assert their own identity.
   const worker = env.LOADER.get(hash, async () => ({
     compatibilityDate: "2026-10-12",
     mainModule: "app.js",
     modules: { "app.js": code ?? (await readCode()) },
-    env: { HASH: hash },
+    env: {
+      HASH: hash,
+      NOTES: exports.ScopedNotes({ props: {} }),
+      SCHEDULER: exports.Scheduler({ props: {} }),
+    },
     globalOutbound: null,
   }));
   if (preflight) {
@@ -62,10 +66,7 @@ export async function loadApp(
   }
   return {
     class: worker.getDurableObjectClass<App>("App", {
-      props: {
-        notes: exports.ScopedNotes({ props: scope }),
-        scheduler: exports.Scheduler({ props: { supervisorId: scope.supervisorId, facet } }),
-      },
+      props: { ...scope, facet },
     }),
   };
 }

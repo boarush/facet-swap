@@ -53,18 +53,20 @@ function facet() {
   const env = {
     HASH: "1234567890abcdef",
   };
-  const props = {
+  const services = {
     notes: {
-      get: vi.fn<(key: string) => Promise<string>>(async (key) => key),
-      put: vi.fn<(key: string, value: string) => Promise<void>>(async () => {}),
+      get: vi.fn<(scope: unknown, key: string) => Promise<string>>(async (_scope, key) => key),
+      put: vi.fn<(scope: unknown, key: string, value: string) => Promise<void>>(async () => {}),
       revision: async () => "g1",
     },
     scheduler: {
       getAlarm: async () => null,
-      setAlarm: vi.fn<(time: number | Date) => Promise<void>>(async () => {}),
-      deleteAlarm: vi.fn<() => Promise<void>>(async () => {}),
+      setAlarm: vi.fn<(scope: unknown, time: number | Date) => Promise<void>>(async () => {}),
+      deleteAlarm: vi.fn<(scope: unknown) => Promise<void>>(async () => {}),
     },
   };
+  Object.assign(env, { NOTES: services.notes, SCHEDULER: services.scheduler });
+  const props = { supervisorId: "user", readOnly: false, facet: "app" };
   const db = new DatabaseSync(":memory:");
   const app = new App(
     // The unit harness implements only the storage and RPC surface exercised here.
@@ -91,7 +93,7 @@ function facet() {
     env as unknown as ConstructorParameters<typeof App>[1],
   );
   return {
-    props,
+    props: services,
     data,
     app,
     fetch: (path: string, init?: RequestInit) =>
@@ -228,11 +230,11 @@ test("typed alarms order entries, cancel and rearm, retry independently, and acc
   const { Alarms } = await import("../src/alarms");
   const db = new DatabaseSync(":memory:");
   const scheduler = {
-    setAlarm: vi.fn<(time: number | Date) => Promise<void>>(async () => {}),
-    deleteAlarm: vi.fn<() => Promise<void>>(async () => {}),
+    setAlarm: vi.fn<(scope: unknown, time: number | Date) => Promise<void>>(async () => {}),
+    deleteAlarm: vi.fn<(scope: unknown) => Promise<void>>(async () => {}),
   };
   const ctx = {
-    props: { scheduler },
+    props: { supervisorId: "user", facet: "app" },
     storage: {
       sql: {
         exec: (query: string, ...bindings: (string | number | null)[]) => {
@@ -258,11 +260,15 @@ test("typed alarms order entries, cancel and rearm, retry independently, and acc
       seen.push(payload.key);
     },
   };
-  const queue = new Alarms(ctx, handlers);
+  const queue = new Alarms(
+    ctx,
+    scheduler as unknown as Service<import("../src/scheduler").Scheduler>,
+    handlers,
+  );
   const cancelled = await queue.schedule("cleanup", 2, { key: "cancelled" });
   await queue.schedule("reminder", 3, { text: "first" });
   await queue.cancel(cancelled);
-  assert.equal(scheduler.setAlarm.mock.lastCall?.[0], 3);
+  assert.equal(scheduler.setAlarm.mock.lastCall?.[1], 3);
   await queue.schedule("reminder", 3, { text: "second" });
   await queue.schedule("cleanup", 4, { key: "third" });
   await queue.schedule("reminder", 5, { text: "retry" });
@@ -275,7 +281,11 @@ test("typed alarms order entries, cancel and rearm, retry independently, and acc
   assert.equal(seen.at(-1), "child");
   fail = false;
   db.exec("UPDATE alarms SET time = 1");
-  await new Alarms(ctx, handlers).run();
+  await new Alarms(
+    ctx,
+    scheduler as unknown as Service<import("../src/scheduler").Scheduler>,
+    handlers,
+  ).run();
   assert.equal(seen.at(-1), "retry");
   assert.deepEqual(queue.list(), []);
   assert(scheduler.deleteAlarm.mock.calls.length > 0);
@@ -288,7 +298,7 @@ test("unknown alarm types retry and drop after ten failures", async () => {
   const db = new DatabaseSync(":memory:");
   const scheduler = h.props.scheduler;
   const ctx = {
-    props: { scheduler },
+    props: { supervisorId: "user", facet: "app" },
     storage: {
       sql: {
         exec: (query: string, ...bindings: (string | number | null)[]) => {
@@ -302,7 +312,11 @@ test("unknown alarm types retry and drop after ten failures", async () => {
       },
     },
   } as unknown as ConstructorParameters<typeof Alarms>[0];
-  const queue = new Alarms(ctx, {});
+  const queue = new Alarms(
+    ctx,
+    scheduler as unknown as Service<import("../src/scheduler").Scheduler>,
+    {},
+  );
   db.exec("INSERT INTO alarms (type,time,payload,attempts) VALUES ('removed',1,'{}',0)");
   await queue.run();
   assert.equal(queue.list()[0].attempts, 1);

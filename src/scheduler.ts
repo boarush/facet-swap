@@ -2,21 +2,21 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 
 import type { Env } from "../alchemy.run";
 
-// Same loopback specialization as Notes, but confined to this Supervisor's alarm.
-export class Scheduler extends WorkerEntrypoint<Env, { supervisorId: string; facet: string }> {
-  #supervisor() {
-    return this.env.SUPERVISORS.get(this.env.SUPERVISORS.idFromString(this.ctx.props.supervisorId));
+export type AlarmScope = { supervisorId: string; facet: string };
+export class Scheduler extends WorkerEntrypoint<Env> {
+  #supervisor(scope: AlarmScope) {
+    return this.env.SUPERVISORS.get(this.env.SUPERVISORS.idFromString(scope.supervisorId));
   }
 
-  setAlarm(time: number | Date): Promise<void> {
-    return this.#supervisor().setAlarm(this.ctx.props.facet, time);
+  setAlarm(scope: AlarmScope, time: number | Date): Promise<void> {
+    return this.#supervisor(scope).setAlarm(scope.facet, time);
   }
 
-  getAlarm(): Promise<number | null> {
-    return this.#supervisor().getAlarm(this.ctx.props.facet);
+  getAlarm(scope: AlarmScope): Promise<number | null> {
+    return this.#supervisor(scope).getAlarm(scope.facet);
   }
 
-  deleteAlarm(): Promise<void> {
-    return this.#supervisor().deleteAlarm(this.ctx.props.facet);
+  deleteAlarm(scope: AlarmScope): Promise<void> {
+    return this.#supervisor(scope).deleteAlarm(scope.facet);
   }
 }
