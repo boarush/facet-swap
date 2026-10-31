@@ -6,7 +6,7 @@ import { createRouter } from "./router";
 import { trackResponseBody, type UpdateAbort } from "./stream-lifetime";
 import { loadApp, VersionSource } from "./version-source";
 
-type ScheduledAlarm = { time: number; token: string };
+type ScheduledAlarm = { name: string; time: number; token: string };
 
 type AppConfig = { hash: string; generation: number; readOnly: boolean };
 type VersionState = {
@@ -30,7 +30,7 @@ type SwapRow = {
 export class Supervisor extends DurableObject<Env> {
   private state: VersionState;
   private swapping = false;
-  private runningAlarm?: string;
+  private readonly runningAlarms = new Map<string, string>();
   private readonly active = new Set<AbortController>();
   private readonly streams = new Set<AbortController>();
   private drainTimer?: ReturnType<typeof setTimeout>;
@@ -50,7 +50,8 @@ export class Supervisor extends DurableObject<Env> {
     `);
     ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS facets (
-        name TEXT PRIMARY KEY, createdAt INTEGER NOT NULL, loadedHash TEXT NOT NULL, loadedAt INTEGER NOT NULL
+        name TEXT PRIMARY KEY, createdAt INTEGER NOT NULL, loadedHash TEXT NOT NULL, loadedAt INTEGER NOT NULL,
+        alarmTime INTEGER, alarmToken TEXT
       )
     `);
     // Inflight tracking cannot survive restart; finish any persisted pending swap on wake.
@@ -117,59 +118,102 @@ export class Supervisor extends DurableObject<Env> {
     return this.router.fetch(request, this.env);
   }
 
-  // Keep the logical due time separate from the physical alarm's drain deferrals.
-  async setAlarm(time: number | Date): Promise<void> {
-    const scheduled = { time: Number(time), token: crypto.randomUUID() };
-    await this.ctx.storage.transaction(async (storage) => {
-      await storage.put("app-alarm", scheduled);
-      await storage.setAlarm(scheduled.time);
+  // Keep each logical due time separate from the physical alarm's drain deferrals.
+  async setAlarm(facet: string, time: number | Date): Promise<void> {
+    await this.ctx.storage.transaction(async () => {
+      this.ctx.storage.sql.exec(
+        "UPDATE facets SET alarmTime = ?, alarmToken = ? WHERE name = ?",
+        Number(time),
+        crypto.randomUUID(),
+        facet,
+      );
+      await this.rearm();
     });
   }
 
-  getAlarm(): number | null {
-    const scheduled = this.ctx.storage.kv.get<ScheduledAlarm>("app-alarm");
+  getAlarm(facet: string): number | null {
+    const [scheduled] = this.ctx.storage.sql
+      .exec<ScheduledAlarm>(
+        "SELECT name, alarmTime AS time, alarmToken AS token FROM facets WHERE name = ? AND alarmTime IS NOT NULL",
+        facet,
+      )
+      .toArray();
     // Like native alarms, the running delivery is not a pending alarm.
-    return scheduled && scheduled.token !== this.runningAlarm ? scheduled.time : null;
+    return scheduled && scheduled.token !== this.runningAlarms.get(facet) ? scheduled.time : null;
   }
 
-  async deleteAlarm(): Promise<void> {
-    await this.ctx.storage.transaction(async (storage) => {
-      await storage.delete("app-alarm");
-      await storage.deleteAlarm();
+  async deleteAlarm(facet: string): Promise<void> {
+    await this.ctx.storage.transaction(async () => {
+      this.ctx.storage.sql.exec(
+        "UPDATE facets SET alarmTime = NULL, alarmToken = NULL WHERE name = ?",
+        facet,
+      );
+      await this.rearm();
     });
+  }
+
+  private async rearm(retrying = false): Promise<void> {
+    // Delivery rearms once after all handlers, preserving native retry metadata on failure.
+    if (this.runningAlarms.size) return;
+    const [{ time }] = this.ctx.storage.sql
+      .exec<{ time: number | null }>("SELECT MIN(alarmTime) AS time FROM facets")
+      .toArray();
+    // Replacing an overdue native alarm resets its retry metadata. Let the throw retry it.
+    if (retrying && time !== null && time <= Date.now() && !this.state.pending) return;
+    if (time === null) await this.ctx.storage.deleteAlarm();
+    else
+      await this.ctx.storage.setAlarm(
+        this.state.pending ? Math.max(time, Date.now() + 2000) : time,
+      );
   }
 
   async alarm(info?: AlarmInvocationInfo): Promise<void> {
     await this.checkForUpdate();
-    const scheduled = this.ctx.storage.kv.get<ScheduledAlarm>("app-alarm");
-    if (!scheduled) return;
-    if (scheduled.time > Date.now() || this.state.pending) {
-      // Deferral doesn't consume the alarm or reset the hard drain deadline.
-      await this.ctx.storage.setAlarm(Math.max(scheduled.time, Date.now() + 2000));
-      return;
-    }
-    if (!this.state.current) throw new Error("Publish a version first");
-    const { release } = this.beginWork();
-    this.runningAlarm = scheduled.token;
-    try {
-      // 'alarm' is reserved on DO RPC; the facet's tiny bridge calls its handler.
-      // Runtime AlarmInvocationInfo is not RPC-serializable; copy its public fields.
-      await this.app().dispatchAlarm(
-        info && {
-          scheduledTime: scheduled.time,
-          retryCount: info.retryCount,
-          isRetry: info.isRetry,
-        },
-      );
-      // A handler can rearm, even for the same time; don't erase its new alarm.
-      if (this.ctx.storage.kv.get<ScheduledAlarm>("app-alarm")?.token === scheduled.token) {
-        this.ctx.storage.kv.delete("app-alarm");
+    const due = this.ctx.storage.sql
+      .exec<ScheduledAlarm>(
+        "SELECT name, alarmTime AS time, alarmToken AS token FROM facets WHERE alarmTime <= ? ORDER BY alarmTime, name",
+        Date.now(),
+      )
+      .toArray();
+    const failures: unknown[] = [];
+    for (const scheduled of due) {
+      if (this.state.pending) break;
+      // A preceding handler may cancel or replace another facet's wake-up.
+      const [current] = this.ctx.storage.sql
+        .exec<{ token: string | null }>(
+          "SELECT alarmToken AS token FROM facets WHERE name = ?",
+          scheduled.name,
+        )
+        .toArray();
+      if (current?.token !== scheduled.token) continue;
+      if (!this.state.current) throw new Error("Publish a version first");
+      const { release } = this.beginWork();
+      this.runningAlarms.set(scheduled.name, scheduled.token);
+      try {
+        // 'alarm' is reserved on DO RPC; copy the runtime's non-serializable metadata.
+        await this.facet(scheduled.name).dispatchAlarm(
+          info && {
+            scheduledTime: scheduled.time,
+            retryCount: info.retryCount,
+            isRetry: info.isRetry,
+          },
+        );
+        // A rearm, even at the same time, must survive completion.
+        this.ctx.storage.sql.exec(
+          "UPDATE facets SET alarmTime = NULL, alarmToken = NULL WHERE name = ? AND alarmToken = ?",
+          scheduled.name,
+          scheduled.token,
+        );
+      } catch (error) {
+        // Leave this row intact for native retry, but still deliver other facets.
+        failures.push(error);
+      } finally {
+        this.runningAlarms.delete(scheduled.name);
+        release();
       }
-    } finally {
-      // On error leave the durable record intact and let native alarm retries run.
-      this.runningAlarm = undefined;
-      release();
     }
+    await this.rearm(failures.length > 0);
+    if (failures.length) throw failures[0];
   }
 
   private checkForUpdate(): Promise<void> {
@@ -197,7 +241,7 @@ export class Supervisor extends DurableObject<Env> {
           supervisorId: this.ctx.id.toString(),
           readOnly: this.target()?.readOnly ?? false,
         };
-        await loadApp(this.env, latest.hash, scope, true);
+        await loadApp(this.env, latest.hash, scope, "app", true);
         // A scope change may land during preflight; never stage the stale permission.
         // The module is already validated, so the facet receives its current scope through props.
         const readOnly = this.target()?.readOnly ?? false;
@@ -278,29 +322,33 @@ export class Supervisor extends DurableObject<Env> {
         this.active.clear();
       }
       // Abort restarts facet code but preserves its SQLite storage.
-      this.ctx.facets.abort(
-        "app",
-        new Error(force ? "Drain deadline exceeded" : "Code or scope updated"),
-      );
+      for (const { name } of this.ctx.storage.sql
+        .exec<{ name: string }>("SELECT name FROM facets")
+        .toArray()) {
+        this.ctx.facets.abort(
+          name,
+          new Error(force ? "Drain deadline exceeded" : "Code or scope updated"),
+        );
+      }
     } finally {
       this.swapping = false;
     }
   }
 
-  private app() {
+  private facet(name: string) {
     const { hash, readOnly } = this.state.current!;
     const scope = { supervisorId: this.ctx.id.toString(), readOnly };
-    return this.ctx.facets.get("app", () => {
+    return this.ctx.facets.get(name, () => {
       // The callback runs only when the runtime instantiates the facet, so this records real loads.
       this.ctx.storage.sql.exec(
-        `INSERT INTO facets VALUES (?, ?, ?, ?)
+        `INSERT INTO facets (name, createdAt, loadedHash, loadedAt) VALUES (?, ?, ?, ?)
           ON CONFLICT (name) DO UPDATE SET loadedHash = excluded.loadedHash, loadedAt = excluded.loadedAt`,
-        "app",
+        name,
         Date.now(),
         hash,
         Date.now(),
       );
-      return loadApp(this.env, hash, scope);
+      return loadApp(this.env, hash, scope, name);
     });
   }
 
@@ -318,7 +366,7 @@ export class Supervisor extends DurableObject<Env> {
   private async serve(request: Request): Promise<Response> {
     const { controller, release } = this.beginWork();
     try {
-      const response = await this.app().fetch(request);
+      const response = await this.facet("app").fetch(request);
       if (response.body && !controller.signal.aborted) this.streams.add(controller);
       return trackResponseBody(response, controller.signal, release);
     } catch (error) {

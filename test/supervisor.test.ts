@@ -105,7 +105,7 @@ function harness() {
     id: { toString: () => "user" },
     storage,
     facets: {
-      get: vi.fn<() => typeof facet>(() => facet),
+      get: vi.fn<(name: string) => typeof facet>(() => facet),
       abort: vi.fn<(name: string, reason: Error) => void>(),
     },
   };
@@ -142,6 +142,13 @@ function harness() {
   // These partial fakes deliberately model only the Supervisor's exercised dependencies.
   const create = () => new Supervisor(ctx as unknown as DurableObjectState, env as unknown as Env);
   const supervisor = create();
+  // The stub bypasses the runtime's loader callback; model its registered app facet.
+  storage.sql.exec(
+    "INSERT INTO facets (name, createdAt, loadedHash, loadedAt) VALUES ('app', ?, ?, ?)",
+    Date.now(),
+    hash(1),
+    Date.now(),
+  );
   const fetch = (path: string, init?: RequestInit, s = supervisor) =>
     s.fetch(new Request("http://local" + path, init));
   const status = async (s = supervisor) =>
@@ -176,20 +183,20 @@ function harness() {
 test("failed delivery persists across Supervisor restart and is retried on latest code", async () => {
   const h = harness();
   const due = Date.now() - 1;
-  await h.supervisor.setAlarm(due);
+  await h.supervisor.setAlarm("app", due);
   h.facet.dispatchAlarm.mockImplementationOnce(async () => {
-    assert.equal(h.supervisor.getAlarm(), null);
+    assert.equal(h.supervisor.getAlarm("app"), null);
     assert.equal((await h.status()).inflight, 1);
     throw new Error("transient");
   });
   await assert.rejects(h.supervisor.alarm(), /transient/);
-  assert.equal(h.supervisor.getAlarm(), due);
+  assert.equal(h.supervisor.getAlarm("app"), due);
   assert.equal((await h.status()).inflight, 0);
   h.env.latest = hash(2);
   const restarted = h.create();
-  assert.equal(restarted.getAlarm(), due);
+  assert.equal(restarted.getAlarm("app"), due);
   await restarted.alarm({ scheduledTime: due, retryCount: 1, isRetry: true });
-  assert.equal(restarted.getAlarm(), null);
+  assert.equal(restarted.getAlarm("app"), null);
   assert.equal((await h.status(restarted)).current!.hash, hash(2));
   assert.deepEqual(h.facet.dispatchAlarm.mock.calls[1][0], {
     scheduledTime: due,
@@ -201,28 +208,28 @@ test("failed delivery persists across Supervisor restart and is retried on lates
 test("handler rearming for the same timestamp is not erased on completion", async () => {
   const h = harness();
   const due = Date.now() - 1;
-  await h.supervisor.setAlarm(new Date(due));
+  await h.supervisor.setAlarm("app", new Date(due));
   h.facet.dispatchAlarm.mockImplementationOnce(async () => {
-    assert.equal(h.supervisor.getAlarm(), null);
-    await h.supervisor.setAlarm(due);
-    assert.equal(h.supervisor.getAlarm(), due);
+    assert.equal(h.supervisor.getAlarm("app"), null);
+    await h.supervisor.setAlarm("app", due);
+    assert.equal(h.supervisor.getAlarm("app"), due);
   });
   await h.supervisor.alarm();
-  assert.equal(h.supervisor.getAlarm(), due);
+  assert.equal(h.supervisor.getAlarm("app"), due);
   await h.supervisor.alarm();
-  assert.equal(h.supervisor.getAlarm(), null);
+  assert.equal(h.supervisor.getAlarm("app"), null);
 });
 
 test("deletion during failed delivery cancels any later retry", async () => {
   const h = harness();
-  await h.supervisor.setAlarm(Date.now() - 1);
+  await h.supervisor.setAlarm("app", Date.now() - 1);
   h.facet.dispatchAlarm.mockImplementationOnce(async () => {
-    await h.supervisor.deleteAlarm();
+    await h.supervisor.deleteAlarm("app");
     throw new Error("already cancelled");
   });
   await assert.rejects(h.supervisor.alarm(), /already cancelled/);
   await h.supervisor.alarm();
-  assert.equal(h.supervisor.getAlarm(), null);
+  assert.equal(h.supervisor.getAlarm("app"), null);
   assert.equal(h.native(), null);
   assert.equal(h.facet.dispatchAlarm.mock.calls.length, 1);
 });
@@ -230,18 +237,18 @@ test("deletion during failed delivery cancels any later retry", async () => {
 test("a stale native callback cannot deliver an alarm replaced with a future time", async () => {
   const h = harness();
   const future = Date.now() + 60000;
-  await h.supervisor.setAlarm(future);
+  await h.supervisor.setAlarm("app", future);
   await h.supervisor.alarm();
   assert.equal(h.facet.dispatchAlarm.mock.calls.length, 0);
   assert.equal(h.native(), future);
-  assert.equal(h.supervisor.getAlarm(), future);
+  assert.equal(h.supervisor.getAlarm("app"), future);
 });
 
 test("an executing alarm counts as inflight and a hard swap retries it on new code", async () => {
   vi.useFakeTimers();
   const h = harness();
   const due = Date.now() - 1;
-  await h.supervisor.setAlarm(due);
+  await h.supervisor.setAlarm("app", due);
   let interrupt: ((reason: Error) => void) | undefined;
   h.facet.dispatchAlarm.mockImplementationOnce(
     () =>
@@ -263,15 +270,15 @@ test("an executing alarm counts as inflight and a hard swap retries it on new co
   assert.equal((await h.status()).inflight, 0);
   assert.equal((await h.swaps())[0].abortedStreams, 0);
   assert.equal((await h.swaps())[0].forced, true);
-  assert.equal(h.supervisor.getAlarm(), due);
+  assert.equal(h.supervisor.getAlarm("app"), due);
   await h.supervisor.alarm();
-  assert.equal(h.supervisor.getAlarm(), null);
+  assert.equal(h.supervisor.getAlarm("app"), null);
 });
 
 test("pending swap and due alarm both survive reconstruction without a fresh drain window", async () => {
   const h = harness();
   const due = Date.now() - 1;
-  await h.supervisor.setAlarm(due);
+  await h.supervisor.setAlarm("app", due);
   h.data.set("app-config", {
     current: { hash: hash(1), generation: 1, readOnly: false },
     pending: { hash: hash(2), generation: 2, readOnly: false },
@@ -281,7 +288,7 @@ test("pending swap and due alarm both survive reconstruction without a fresh dra
   const restarted = h.create();
   assert.equal((await h.status(restarted)).current!.hash, hash(2));
   assert.equal((await h.status(restarted)).pending, null);
-  assert.equal(restarted.getAlarm(), due);
+  assert.equal(restarted.getAlarm("app"), due);
   assert.deepEqual((await h.swaps(restarted))[0], {
     id: 1,
     oldHash: hash(1),
@@ -295,7 +302,7 @@ test("pending swap and due alarm both survive reconstruction without a fresh dra
   });
   assert.equal((await h.swaps(h.create())).length, 1);
   await restarted.alarm();
-  assert.equal(restarted.getAlarm(), null);
+  assert.equal(restarted.getAlarm("app"), null);
 });
 
 test("Hono control routes retain update-check ordering and do not reach the facet", async () => {
@@ -558,14 +565,14 @@ test("KV failure serves current requests and alarms, then retries at the next in
   h.env.CHECK_INTERVAL_MS = "100";
   h.env.VERSIONS.get.mockRejectedValueOnce(new Error("KV unavailable"));
   assert.equal((await h.fetch("/version")).status, 200);
-  await h.supervisor.setAlarm(Date.now() - 1);
+  await h.supervisor.setAlarm("app", Date.now() - 1);
   await h.supervisor.alarm();
   assert.equal(h.facet.dispatchAlarm.mock.calls.length, 1);
   assert.equal(h.env.VERSIONS.get.mock.calls.length, 1);
   h.env.latest = hash(2);
   await vi.advanceTimersByTimeAsync(100);
   h.env.VERSIONS.get.mockRejectedValueOnce(new Error("KV unavailable on alarm"));
-  await h.supervisor.setAlarm(Date.now() - 1);
+  await h.supervisor.setAlarm("app", Date.now() - 1);
   await h.supervisor.alarm();
   assert.equal(h.facet.dispatchAlarm.mock.calls.length, 2);
   assert.equal((await h.status()).current!.hash, hash(1));
@@ -650,4 +657,85 @@ test("invalid generation and code read failure never close admission", async () 
   assert.equal((await h.status()).pending, null);
   assert.equal((await h.status()).current!.hash, hash(1));
   assert.equal(diagnostic.mock.calls.length, 6);
+});
+
+test("facets arm the minimum wake-up and deliver only their own due alarm", async () => {
+  const h = harness();
+  h.storage.sql.exec(
+    "INSERT INTO facets (name, createdAt, loadedHash, loadedAt) VALUES ('other', ?, ?, ?)",
+    Date.now(),
+    hash(1),
+    Date.now(),
+  );
+  const other = { dispatchAlarm: vi.fn<() => Promise<void>>(async () => {}), fetch: h.facet.fetch };
+  h.ctx.facets.get.mockImplementation((name: string) => (name === "other" ? other : h.facet));
+  const due = Date.now() - 1;
+  const future = Date.now() + 60000;
+  await h.supervisor.setAlarm("other", future);
+  await h.supervisor.setAlarm("app", due);
+  assert.equal(h.native(), due);
+  assert.equal(h.supervisor.getAlarm("other"), future);
+  await h.supervisor.alarm();
+  assert.equal(h.facet.dispatchAlarm.mock.calls.length, 1);
+  assert.equal(other.dispatchAlarm.mock.calls.length, 0);
+  assert.equal(h.supervisor.getAlarm("app"), null);
+  assert.equal(h.native(), future);
+  await h.supervisor.setAlarm("other", due);
+  await h.supervisor.alarm();
+  assert.equal(other.dispatchAlarm.mock.calls.length, 1);
+  assert.equal(h.facet.dispatchAlarm.mock.calls.length, 1);
+  assert.equal(h.native(), null);
+});
+
+test("a failed facet does not block another due facet and retains only its own retry", async () => {
+  const h = harness();
+  h.storage.sql.exec(
+    "INSERT INTO facets (name, createdAt, loadedHash, loadedAt) VALUES ('other', ?, ?, ?)",
+    Date.now(),
+    hash(1),
+    Date.now(),
+  );
+  const other = {
+    dispatchAlarm: vi.fn<() => Promise<void>>(async () => {
+      assert.equal(h.supervisor.getAlarm("other"), null);
+      assert.equal(h.supervisor.getAlarm("app"), due);
+      await h.supervisor.deleteAlarm("other");
+    }),
+    fetch: h.facet.fetch,
+  };
+  h.ctx.facets.get.mockImplementation((name: string) => (name === "other" ? other : h.facet));
+  const due = Date.now() - 1;
+  await h.supervisor.setAlarm("app", due);
+  await h.supervisor.setAlarm("other", due);
+  h.facet.dispatchAlarm.mockRejectedValueOnce(new Error("app failed"));
+  const arm = vi.spyOn(h.storage, "setAlarm");
+  await assert.rejects(h.supervisor.alarm(), /app failed/);
+  assert.equal(arm.mock.calls.length, 0);
+  assert.equal(other.dispatchAlarm.mock.calls.length, 1);
+  assert.equal(h.supervisor.getAlarm("other"), null);
+  assert.equal(h.supervisor.getAlarm("app"), due);
+  assert.equal(h.native(), due);
+  await h.supervisor.alarm();
+  assert.equal(h.native(), null);
+  assert.equal(other.dispatchAlarm.mock.calls.length, 1);
+});
+
+test("deleting one facet alarm keeps the other armed and swaps abort every registered facet", async () => {
+  const h = harness();
+  h.storage.sql.exec(
+    "INSERT INTO facets (name, createdAt, loadedHash, loadedAt) VALUES ('other', ?, ?, ?)",
+    Date.now(),
+    hash(1),
+    Date.now(),
+  );
+  const time = Date.now() + 60000;
+  await h.supervisor.setAlarm("app", time);
+  await h.supervisor.setAlarm("other", time + 1000);
+  await h.supervisor.deleteAlarm("app");
+  assert.equal(h.supervisor.getAlarm("app"), null);
+  assert.equal(h.native(), time + 1000);
+  h.env.latest = hash(2);
+  await h.fetch("/version", { method: "HEAD" });
+  assert.deepEqual(h.ctx.facets.abort.mock.calls.map(([name]) => name).sort(), ["app", "other"]);
+  assert.equal(h.supervisor.getAlarm("other"), time + 1000);
 });

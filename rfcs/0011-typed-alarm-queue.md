@@ -38,7 +38,15 @@ One table in facet SQLite: `alarms(id, type, time, payload, attempts)`, indexed 
 
 ### Arming
 
-After every `schedule` or `cancel`, the facet sets the Supervisor's alarm to the earliest `time` in the table, or deletes it when the table is empty. The Supervisor's alarm logic stays unchanged, including deferral during drains.
+After every `schedule` or `cancel`, the facet sets the Supervisor's alarm to the earliest `time` in the table, or deletes it when the table is empty. The Supervisor defers delivery during drains without consuming the logical wake-up.
+
+### Multiple facets
+
+Each scheduler stub has immutable `{ supervisorId, facet }` props, so a facet can change only its own wake-up. The Supervisor stores `alarmTime` and `alarmToken` on each row of its `facets` registry. Its single native alarm is armed for the minimum wake-up across all facets, or deleted when none remain.
+
+A native delivery snapshots due facets and dispatches them serially. A failed facet keeps its wake-up for native retry without blocking the others; after the loop the Supervisor rearms the minimum and rethrows the first failure. Rearming is deferred until the delivery loop finishes. If a failed wake-up is still overdue, the existing native retry owns it; explicitly setting a new native alarm would reset retry metadata. During delivery, `getAlarm()` hides only that facet's running token. A handler's replacement token survives completion, even when it uses the same time. Cancelling one facet does not affect another's schedule.
+
+Code and scope swaps abort every registered facet. Their registry rows and wake-ups survive replacement.
 
 ### Delivery
 

@@ -33,7 +33,13 @@ export class VersionSource {
   }
 }
 
-export async function loadApp(env: Env, hash: string, scope: NotesScope, preflight = false) {
+export async function loadApp(
+  env: Env,
+  hash: string,
+  scope: NotesScope,
+  facet: string,
+  preflight = false,
+) {
   const readCode = async () => {
     const object = await env.CODE.get("code/" + hash + ".js");
     if (!object) throw new Error("Missing code " + hash);
@@ -58,7 +64,7 @@ export async function loadApp(env: Env, hash: string, scope: NotesScope, preflig
     class: worker.getDurableObjectClass<App>("App", {
       props: {
         notes: exports.ScopedNotes({ props: scope }),
-        scheduler: exports.Scheduler({ props: { supervisorId: scope.supervisorId } }),
+        scheduler: exports.Scheduler({ props: { supervisorId: scope.supervisorId, facet } }),
       },
     }),
   };
