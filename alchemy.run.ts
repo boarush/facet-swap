@@ -87,8 +87,12 @@ export const milliseconds = Effect.fn("milliseconds")(function* (name: string, f
   return yield* config.parse(ConfigProvider.fromEnv({ preserveEmptyStrings: true }));
 });
 
+// Alchemy empties a bucket on destroy only when its last deployed props opted in,
+// so non-prod stages carry the flag from their first deploy. Prod keeps R2's refusal.
+const disposable = Effect.map(Alchemy.Stage, (stage) => ({ forceDestroy: stage !== "prod" }));
+
 export const gatewayWorker = Effect.fn("gatewayWorker")(function* (gatewayRevision: string = "g1") {
-  const notes = yield* Cloudflare.R2.Bucket("Notes");
+  const notes = yield* Cloudflare.R2.Bucket("Notes", yield* disposable);
   return yield* Cloudflare.Worker("Gateway", {
     main: "./src/gateway.ts",
     compatibility: { date: "2026-10-12", flags: ["no_nodejs_compat"] },
@@ -101,7 +105,7 @@ export const resources = Effect.fn("resources")(function* (
   label = version,
   gatewayRevision = "g1",
 ) {
-  const code = yield* Cloudflare.R2.Bucket("Code");
+  const code = yield* Cloudflare.R2.Bucket("Code", yield* disposable);
   const versions = yield* Cloudflare.KV.Namespace("Versions");
 
   const bundle = yield* bundleFacet(label);
