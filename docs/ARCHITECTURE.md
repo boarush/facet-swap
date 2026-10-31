@@ -4,23 +4,27 @@
 
 ## Purpose
 
-This local prototype changes application code with a bounded drain. A stable Supervisor lets current work finish before replacing a named application facet, up to a configurable deadline. Work still running at the deadline is cut to bound the drain window. Each user updates independently, and the facet's SQLite-backed state survives replacement.
+facet-swap replaces application code while giving existing work time to finish. The Supervisor waits until the application is ready or a configurable deadline expires. At the deadline, it cuts off unfinished work and replaces the named facet. Each user updates independently. The facet keeps its SQLite state.
 
-This is a demonstration of controlled code replacement, not a guarantee against crashes or arbitrary deployment failures. The checked-in stack runs in Alchemy's local environment and rejects non-dev execution.
+Crashes and deployment failures can still interrupt work. The same stack runs locally with `alchemy dev` and deploys to Cloudflare stages.
 
 ## The Core Idea
 
 The entry Worker routes `/u/<user>/stream` and `/u/<user>/version` to a Supervisor selected by `getByName(user)`. Each Supervisor owns a facet named `app`.
 
-HTTP routing uses Hono in the entry Worker, Supervisor, and application facet. The shared router keeps exact, encoded path matching and propagates unexpected errors to the runtime.
+The entry Worker, Supervisor, and application facet use a shared Hono router. It matches encoded paths exactly and lets unexpected errors reach the runtime.
 
 User IDs are raw URL segments, so encoded IDs do not alias decoded ones. Health, publication, status, version, and stream routes accept GET and automatic HEAD. Scope control accepts PUT, notes accept GET/PUT, and alarms accept GET/PUT/DELETE. Unsupported methods on these routes return 405.
 
-SSE handlers return raw response bodies. The shared router cancels discarded HEAD bodies before Hono strips them, releasing Supervisor inflight tracking. The gateway exposes RPC only; its HTTP handler returns 404.
+SSE handlers return raw response bodies. For HEAD requests, the shared router cancels the body before Hono removes it. This releases the Supervisor's inflight entry. The gateway accepts RPC calls only. Its HTTP handler returns 404.
 
-The **Supervisor** has stable code. It handles admission, preserves forced-cut response hints, and persists the current and pending configurations in its own SQLite-backed storage.
+The **Supervisor** runs stable code. It decides whether to admit requests and keeps response wrappers so it can signal a forced cut. It stores current and pending configurations in its own SQLite database.
 
-The **Facet** contains the application logic. Worker Loader loads its module by content hash from R2. The facet has a separate SQLite database, preserved when the Supervisor aborts and recreates it. An optional manual label is compiled into the module as a salt; no label is needed for publication. Its hash is passed as `env.HASH`, avoiding a self-referential hash. Both `/version` and SSE events show a 12-character hash in `v`, the full `hash`, and a `label` only when one is set. It receives unscoped Notes and scheduler forwarding stubs through its loader environment and plain `{ supervisorId, readOnly, facet }` class props, not raw resource bindings.
+The **Facet** runs the application code. Worker Loader reads its module from R2 by content hash. Its separate SQLite database survives when the Supervisor aborts and recreates the facet.
+
+Publication needs no manual label. If one is set, the build includes it in the module as a salt. The loader passes the hash as `env.HASH` so the module does not have to contain its own hash. Both `/version` and SSE events return a 12-character hash in `v` and the full `hash`. They include `label` only when one is set.
+
+The loader environment supplies unscoped Notes and scheduler forwarding stubs. Plain class props carry `{ supervisorId, readOnly, facet }`. The facet receives no raw resource bindings.
 
 ### Architecture
 
@@ -54,33 +58,82 @@ flowchart TB
 
 ## Capabilities Instead of Raw Bindings
 
-The gateway Worker owns the Notes R2 bucket and exports an unscoped `Notes` entrypoint with `get`, `put`, and a revision diagnostic. Its default HTTP handler always returns 404. Only the trusted entry Worker receives the unscoped `GATEWAY` service binding; the Supervisor supplies its Durable Object ID through plain facet props.
+The gateway Worker owns the Notes R2 bucket. Its unscoped `Notes` entrypoint exposes `get`, `put`, and a revision diagnostic. Its default HTTP handler always returns 404. Only the trusted entry Worker receives the unscoped `GATEWAY` service binding. The Supervisor passes its Durable Object ID to the facet in plain props.
 
-The entry Worker exports thin `ScopedNotes` and `Scheduler` forwarding entrypoints. The hash-shared loader environment contains `HASH`, `CHECK_INTERVAL_MS`, and unscoped `NOTES`/`SCHEDULER`/`VERSIONS`/`SWAP` service stubs. Each facet receives plain `{ supervisorId, readOnly, facet }` through `getDurableObjectClass` props and passes that scope to forwarding methods. Production rejects stub-valued Durable Object class props.
+The entry Worker's `ScopedNotes` and `Scheduler` entrypoints forward calls. Facets with the same hash share a loader environment. It contains `HASH`, `CHECK_INTERVAL_MS`, and the unscoped `NOTES`, `SCHEDULER`, `VERSIONS`, and `SWAP` service stubs. Each facet gets `{ supervisorId, readOnly, facet }` through `getDurableObjectClass` props and passes those values to forwarding methods. Production rejects Durable Object class props that contain stubs.
 
-`ScopedNotes` prefixes keys with the supplied Supervisor ID, validates opaque keys, and rejects writes when `readOnly` is set. The facet asserts its own identity and permissions; this is acceptable because application code is trusted, not an isolation boundary against malicious facets. Integration tests exercise per-user isolation with a shared loader hash, alarm isolation, and refreshed permissions after abort.
+`ScopedNotes` validates opaque keys and prefixes them with the supplied Supervisor ID. It rejects writes when `readOnly` is set. The facet supplies its own identity and permissions, so this design requires trusted application code. A malicious facet could lie about those values.
+
+Integration tests check that users sharing a loader hash keep separate data and alarms. They also check that recreating a facet applies new permissions.
+
+```mermaid
+flowchart LR
+  P["Plain class props<br/>supervisorId, readOnly, facet"] --> F["Trusted facet"]
+  F -->|"NOTES.get / put(scope, key)"| N["ScopedNotes loopback"]
+  N -->|"get"| V["Validate key<br/>prefix with supervisorId"]
+  N -->|"put"| W{"Write allowed?"}
+  W -->|"readOnly"| D["Deny"]
+  W -->|"writable"| V
+  V --> G["Gateway Notes RPC"]
+  G --> R[("Notes R2")]
+  F -->|"SCHEDULER methods(scope)"| A["Scheduler loopback"]
+  A -->|"supervisorId and facet"| S["Supervisor logical alarm"]
+```
 
 ### Refreshing Scope
 
-The trusted local control route `PUT /u/<user>/__scope` with JSON `{"readOnly":true}` stages a new configuration with the **same hash**. Current and pending configurations include hash, generation, and permission. An unchanged target permission returns `{ accepted: true, changed: false }` without starting another drain. Scope refresh closes admission with the same 503 retry response as a code update, waits for inflight bodies to finish or the drain deadline, and uses the same abort/recreate path. Both version headers carry the same hash during a scope-only drain. The recreated facet receives the new plain scope props; its SQLite state survives. A revocation therefore takes effect **after draining or at the deadline**, not immediately. The deadline also applies when the code hash stays the same.
+`PUT /u/<user>/__scope` accepts JSON such as `{"readOnly":true}` and stages new permissions with the **same hash**. Current and pending configurations each contain the hash, generation, and permission. If the target permission is unchanged, the route returns `{ accepted: true, changed: false }` without another drain.
 
-The scope route never reaches the facet. It is unauthenticated local test machinery, not a production authorization API. User routes themselves also lack authentication; capability confinement does not prevent a client from choosing another user's URL. Application work outside request lifetimes must participate in readiness and recovery; scope revocation still has a hard deadline.
+The Supervisor rejects new requests with the same 503 retry response used for code updates. It waits for inflight bodies to finish or the deadline to expire, then aborts and recreates the facets. Both version headers carry the same hash during a scope-only drain. The recreated facets get the new plain props and keep their SQLite state. Revocation takes effect **after draining or at the deadline**. Keeping the same code hash does not remove the deadline.
 
-### Gateway Deployment Boundary
+The Supervisor handles the scope route without calling the facet. This route is an unauthenticated local test control. It is unsuitable for production authorization. User routes also lack authentication, so a client can choose another user's URL.
 
-Adding or changing real resources belongs on the gateway, not the Supervisor. The forwarding API must remain compatible; adding entirely new capability methods still requires teaching the trusted forwarding entrypoint how to expose them.
+If application work outlives a request, the app must track that work before declaring readiness and recover it after a restart. Scope revocation still cuts it off at the deadline.
 
-In Alchemy's local provider, a gateway-only revision change restarts Gateway while Api keeps its existing instance. The Supervisor's open stream survives, but its service channel continues reporting the previous gateway revision. The integration test records this limitation. A manual Cloudflare trial reaches the new gateway from an existing Supervisor; the stale channel is reproducible only locally so far. There is no automated production rollout test.
+```mermaid
+sequenceDiagram
+  participant C as Control client
+  participant S as Supervisor
+  participant F as Old facets
+  participant N as Recreated facet
+  C->>S: PUT /__scope with changed readOnly
+  S->>S: Persist same-hash target and deadline
+  Note over S,F: Old facets reject new admission with 503
+  alt Admitted work finishes
+    F-->>S: Release bodies and alarm handlers
+  else Drain deadline
+    S->>S: Select forced replacement
+  end
+  S->>F: closeSockets() best-effort
+  S->>S: Cut remaining work if forced
+  S->>S: Commit props and swap history
+  S->>F: facets.abort(name)
+  C->>S: Next request
+  S->>N: Load same hash with new plain props
+  Note over F,N: Facet SQLite survives
+```
+
+### Gateway Deployment
+
+Add or change resource bindings on the gateway. Keep the forwarding API compatible so the Supervisor can continue using it. A new capability method also needs a method on the trusted forwarding entrypoint.
+
+With Alchemy's local provider, a gateway-only revision change restarts Gateway and leaves Api running. The Supervisor's open stream survives. Its service channel still reports the previous gateway revision, which the integration test records.
+
+A manual Cloudflare trial reaches the new gateway from an existing Supervisor. The stale channel has only been reproduced locally. No automated test covers production rollout.
 
 ## Publishing Is Part of the Stack
 
 `alchemy.run.ts` declares the local R2 bucket, KV namespace, Worker Loader binding, Supervisor namespace, and entry Worker. It defines and calls `bundleFacet` and `publishFacet` during stack evaluation.
 
-Alchemy's `Bundle.build` uses its rolldown helper to produce one ESM module from `src/app.ts`. The file's SHA-256 hash, not the aggregate bundle hash, addresses `code/<hash>.js`. Supervisors do not re-hash what they load; content-address integrity relies on the bucket being private and written only by this stack.
+Alchemy's `Bundle.build` uses its rolldown helper to build `src/app.ts` into one ESM module. The module's SHA-256 hash determines its `code/<hash>.js` key. The aggregate bundle hash is not used. Supervisors do not re-hash loaded code, so the bucket must stay private and only this stack may write to it.
 
-Publication uses two built-in, diffed Alchemy Actions. **FacetCode** takes only the content hash as its persisted, diffed input and writes the module through `WriteBucketLocal`. Module bytes come from the evaluation closure, so the bundle does not enter Action state. **FacetLatest** consumes the upload's successful hash output and writes `{ hash, generation }` to KV `latest`, with version and publication metadata, through `WriteNamespaceLocal`. This dependency prevents publication before the code object exists. Both write through Alchemy's local emulators.
+Two built-in Alchemy Actions compare their inputs with saved state. **FacetCode** saves only the content hash as its input. It writes the module through `WriteBucketLocal`. The evaluation closure supplies the bytes, so Action state does not contain the bundle.
 
-Each stack evaluation bundles the source to discover changes. Identical module bytes skip the R2 upload, and identical hash/version inputs skip the KV write. Editing application source changes the hash without a label bump. Changing the optional label also changes the module bytes, so it forces publication even when the source is unchanged. Unchanged source and label leave both publication metadata and upload time unchanged. A forced reconciliation deliberately reruns the Actions.
+**FacetLatest** takes the successful upload's hash output. It writes `{ hash, generation }` and version and publication metadata to KV `latest` through `WriteNamespaceLocal`. Waiting for that output keeps KV from pointing to code that has not been uploaded. Both Actions write through Alchemy's local emulators.
+
+Each stack evaluation bundles the source to check for changes. If the module bytes are identical, it skips the R2 upload. If the hash and version inputs are identical, it skips the KV write.
+
+Editing application source changes the hash without a label bump. Changing the optional label changes the module bytes too, so it publishes even if the source is unchanged. When neither changes, the publication metadata and upload time stay the same. Forced reconciliation reruns both Actions.
 
 ### Deploy Flow
 
@@ -100,72 +153,225 @@ flowchart TD
   DONE --> REQUEST[Next eligible request checks latest]
 ```
 
-The deploy CLI requests stack evaluation while Alchemy dev is running. The optional label salt changes module bytes; the reconciliation nonce only triggers evaluation. See [Development](DEVELOPMENT.md#local-execution) for commands and salt behavior.
+The deploy CLI asks the running Alchemy dev process to evaluate the stack. The optional label salt changes the module bytes. The reconciliation nonce only triggers evaluation. See [Development](DEVELOPMENT.md#local-execution) for commands and salt behavior.
 
-Changes confined to the application source or salt leave the Supervisor Worker's bundle unchanged, so existing streams survive stack reconciliation. Shared runtime dependencies can also change the stable Workers; editing `src/router.ts`, for example, redeploys both the entry Worker and Supervisor.
+Changing only the application source or salt leaves the Supervisor Worker's bundle unchanged. Existing streams survive that stack reconciliation. Editing shared runtime code can redeploy the stable Workers too. For example, changing `src/router.ts` redeploys both the entry Worker and Supervisor.
 
 ## How a Supervisor Updates
 
-**Notice.** Framework code shipped with the facet checks `versions.latest()` on each request and socket message, at most once per `CHECK_INTERVAL_MS` (10 seconds by default). Concurrent checks share a promise. There is no background polling, and the Supervisor does not poll in fetch or alarm delivery. The Supervisor bootstraps the first publication when a Supervisor has no current configuration.
+**Notice.** The facet's framework code checks `versions.latest()` when a request or socket message arrives. It checks at most once per `CHECK_INTERVAL_MS`, which defaults to 10 seconds. Concurrent checks share a promise. Nothing polls in the background. The Supervisor does not poll during fetch or alarm delivery. If it has no current configuration, it bootstraps the first publication.
 
-A different hash calls `swap.pending(hash)`. The Supervisor validates the exact hash against KV's latest publication, requires a higher positive safe-integer generation, and preflights the module without constructing the facet. Failed checks and preflights keep current code serving. The helper then notifies the application's `onUpdate(hash)` hook. An idle socket detects nothing until its next message.
+When the helper finds a different hash, it calls `swap.pending(hash)`. The Supervisor checks that the hash matches KV's latest publication. The generation must be a positive safe integer greater than the current one. It preflights the module without constructing a facet. If any check or preflight fails, current code keeps serving. After acceptance, the helper calls the application's `onUpdate(hash)` hook. An idle socket discovers no update until its next message.
 
-**Grace window.** Pending code closes admission only for facets still running old code. New requests, including socket upgrades, get 503 with `Retry-After: 1`, `X-Current-Version`, `X-Pending-Version`, and `Cache-Control: no-store`. Existing work continues. The application tracks protected operations and calls `ready()` when idle; the Supervisor does not infer code readiness from response completion. The demo tracks requests, stream lifetimes, and alarm handlers, but not open sockets.
+**Grace window.** Only facets still running old code reject new requests. Those requests, including socket upgrades, receive 503 with `Retry-After: 1`, `X-Current-Version`, `X-Pending-Version`, and `Cache-Control: no-store`. Existing work continues.
 
-**Swap.** Each trusted facet passes `{ supervisorId, facet }` to its unscoped swap stub. Its `ready(scope)` aborts only that facet, after its executing alarm finishes. SQLite survives. New instantiations load the publication target directly, including during another facet's window. Scope changes retain Supervisor response-lifetime draining across all facets, so revocation does not cut admitted work before the deadline.
+The app tracks work that needs to finish and calls `ready()` when idle. Finishing a response does not tell the Supervisor that the code is ready to swap. The demo tracks requests, stream lifetimes, and alarm handlers. Open sockets do not count as protected work.
 
-The facets registry records the actual `loadedHash` and `loadedReadOnly` props; a null hash marks an aborted facet awaiting instantiation. Already-target and uninstantiated facets are never aborted. Supervisor-wide current/pending describe the committed and target publication, not every facet's running code. Current advances and the window closes when no loaded facet needs replacement. The shared deadline forces only the remaining old facets; one stuck facet does not block another's readiness or traffic. SSE cuts and alarm gates are tracked per facet.
+**Swap.** A trusted facet passes `{ supervisorId, facet }` to its unscoped swap stub. Calling `ready(scope)` aborts only that facet and waits for its executing alarm to finish first. Its SQLite database survives. A newly instantiated facet loads the target publication directly, even while another facet is draining.
 
-**Deadline.** The first pending change starts a `DRAIN_DEADLINE_MS` timeout (30 seconds by default). Replacing the target never extends it. The deadline runs as an in-memory timer, which keeps the Supervisor awake (and billed for wall time) for the whole window, so keep it short: tens of seconds, not minutes. If the app never signals readiness, the Supervisor commits and aborts anyway. Retained response wrappers append a best-effort `event: update-abort` to SSE bodies before abort; data contains `reason: "drain-deadline"`, `oldVersion`, and `newVersion`. Other bodies error. These wrappers support cuts and scope drains, not code-readiness decisions.
+For scope changes, the Supervisor tracks response lifetimes across all facets. Revocation waits for admitted work to finish unless the deadline expires.
 
-The timeout exists only during a pending window. It prevents hibernation then, but there are no polling timers outside the window. Persisted pending state is committed on reconstruction; live work and the timer are not crash-recoverable.
+The facets registry stores each facet's actual `loadedHash` and `loadedReadOnly` props. A null hash means the facet was aborted and has not been instantiated again. The Supervisor skips facets already on target and facets that have not been instantiated.
+
+The Supervisor's current and pending configurations describe the committed and target publications. Individual facets may still run different code. Current advances and the window closes once no loaded facet needs replacement. The deadline forces only the remaining old facets, so one stuck facet does not block another's readiness or traffic. The Supervisor tracks SSE cuts and executing alarms separately for each facet.
+
+**Deadline.** The first pending change starts a `DRAIN_DEADLINE_MS` timeout, which defaults to 30 seconds. Replacing the target does not extend it. This in-memory timer keeps the Supervisor awake and billed for wall time throughout the window. Keep the window to tens of seconds rather than minutes.
+
+At the deadline, the Supervisor commits and aborts even if the app never signals readiness. Response wrappers try to append `event: update-abort` to SSE bodies before the abort. Its data contains `reason: "drain-deadline"`, `oldVersion`, and `newVersion`. Other response bodies error. The wrappers let the Supervisor cut responses and drain scope changes. They do not decide when application code is ready.
+
+The timeout exists only while a change is pending. It prevents hibernation during that window. Outside it, there are no polling timers. On reconstruction, the Supervisor commits persisted pending state immediately. It cannot recover live work or the old timer.
+
+### Update Handshake
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant F as Facet framework
+  participant V as Versions loopback
+  participant S as Supervisor via Swap
+  C->>F: Admitted request or socket message
+  F->>V: latest() when check interval allows
+  V-->>F: New hash and generation
+  F->>S: pending(scope, hash)
+  S->>S: Validate KV generation and preflight
+  S->>S: Persist target and start deadline
+  S-->>F: Accepted
+  F->>F: App onUpdate(hash)
+  Note over C,S: New requests to old facets receive 503
+  alt App becomes idle before deadline
+    F-->>C: Close sockets with 1012
+    F->>S: ready(scope)
+    Note over S: Wait for this facet's executing alarm
+  else Deadline expires
+    S->>F: closeSockets() with 1s timeout
+    S->>S: Cut tracked responses
+  end
+  S->>S: Record replacement and clear loadedHash
+  S->>F: facets.abort(name)
+  C->>S: Retry or reconnect
+  S->>F: Instantiate target with preserved SQLite
+```
+
+### Swap States
+
+These phases describe the Supervisor. During a pending window, some facets can run old code while others run the target.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Serving
+  Serving --> Pending: Stage target
+  Pending --> Pending: Replace target without extending deadline
+  Pending --> Swapping: Facet ready and its alarm idle
+  Pending --> Swapping: Scope drain completes
+  Pending --> Swapping: Deadline forces remaining facets
+  Pending --> Swapping: Reconstruction commits pending state
+  Swapping --> Pending: Old facets remain or target changes
+  Swapping --> Serving: No loaded facet needs replacement
+  Serving --> Serving: Load target on demand
+```
+
+### Independent Facet Replacement
+
+```mermaid
+flowchart TD
+  P["Pending target v2<br/>one shared deadline"] --> A["Facet A loaded v1"]
+  P --> B["Facet B loaded v1"]
+  P --> C["Facet C not instantiated"]
+  A -->|"A ready, A alarm idle"| AX["Abort A only"]
+  AX --> AN["Next A request loads v2<br/>traffic admitted"]
+  B --> BW["B still working<br/>new B requests get 503"]
+  BW -->|"B ready or deadline"| BX["Abort B"]
+  C -->|"first request"| CN["Load v2 directly<br/>no abort"]
+  BX --> DONE["No old loaded facets remain<br/>commit current v2, clear pending"]
+  AN -.-> DONE
+  CN -.-> DONE
+```
 
 ### WebSockets
 
-The facet accepts hibernatable sockets with `ctx.acceptWebSocket()` and handles their messages and closes. The Supervisor returns a 101 response unchanged, without a response wrapper or inflight entry. Facet abort does not close hibernated sockets in production. The framework explicitly closes each socket with code 1012 (`service restart`) before calling `swap.ready()`. For deadline, scope-change, and restart swaps, the Supervisor first invokes the facet's `closeSockets()` RPC, best-effort with a one-second timeout per facet, then aborts even if closing fails. Clients reconnect and handle retries. A socket never delays replacement by itself.
+The facet accepts hibernatable sockets with `ctx.acceptWebSocket()` and handles their messages and closes. The Supervisor passes through the 101 response unchanged. It adds no response wrapper or inflight entry.
 
-`/u/<user>/ws` is a small echo demo. Its initial `swap-resumed` frame and each echo include the serving hash. The update hook emits `swap-pending` before readiness. Application-specific buffering, protocol negotiation, and recovery belong to the app.
+Aborting a facet does not close hibernated sockets in production. Before calling `swap.ready()`, the framework closes each socket with code 1012 (`service restart`). For deadline, scope-change, and restart swaps, the Supervisor calls the facet's `closeSockets()` RPC first. It allows one second per facet and aborts even if closing fails. Clients must reconnect and retry. An open socket alone never delays replacement.
+
+`/u/<user>/ws` is a small echo demo. The initial `swap-resumed` frame and each echo include the serving hash. The update hook sends `swap-pending` before declaring readiness. The app handles its own buffering, protocol negotiation, and recovery.
+
+```mermaid
+sequenceDiagram
+  participant C as WebSocket client
+  participant S as Supervisor
+  participant F as App facet
+  C->>S: GET /ws with Upgrade
+  S->>F: Forward admitted upgrade
+  F->>F: acceptWebSocket()
+  F-->>C: swap-resumed with serving hash
+  F-->>S: 101 response
+  S-->>C: Unchanged 101, no inflight body
+  Note over C,F: Idle socket can hibernate without update polling
+  C->>F: Message discovers publication
+  F-->>C: swap-pending with target hash
+  Note over F: Protected work finishes
+  F-->>C: Close 1012 service restart
+  F->>S: swap.ready(scope)
+  S->>F: Abort old facet
+  C->>S: Reconnect and retry 503 if needed
+  S->>F: Load target facet on demand
+  F-->>C: swap-resumed with new serving hash
+```
 
 ### Swap History
 
-Each facet replacement appends a row to the Supervisor's own SQLite `swaps` table, atomically with the current/pending configuration change. It retains only the latest 100 rows. Initial activation is included with a null facet and old hash; this is diagnostic history, not a rollback mechanism.
+Each facet replacement adds a row to the Supervisor's SQLite `swaps` table in the same transaction as the current/pending configuration change. The table keeps the latest 100 rows. Initial activation also adds a row, with null values for the facet and old hash. This history helps diagnose swaps. It does not support rollback.
 
-`GET /u/<user>/__status?swaps=20` returns `{ current, pending, pendingSince, inflight, swapping, swaps }`, with swap rows newest first. `pendingSince` is null when no configuration is pending. The `swaps` count defaults to 20, must be a non-negative safe integer, and is capped at 100; `swaps=0` omits history rows, and invalid values return 400. This read-only route bypasses update checks and admission, so reading it never triggers an update. Other methods return 405 (HEAD reads without a response body).
+`GET /u/<user>/__status?swaps=20` returns `{ current, pending, pendingSince, inflight, swapping, swaps }`. Swap rows appear newest first. With no pending configuration, `pendingSince` is null.
 
-Rows contain `id`, `facet`, `oldHash`, `newHash`, `kind` (`code` for a hash change, `scope` for a same-hash configuration commit), `pendingSince`, `swappedAt`, `forced`, `abortedStreams`, and `restartCommit`. Timestamps are epoch milliseconds; subtract them for drain duration. The original pending time survives replacement of a pending target. A combined code/scope change is classified as code.
+The `swaps` count defaults to 20. It must be a non-negative safe integer and is capped at 100. Use `swaps=0` to omit history rows. Invalid values return 400.
 
-`forced` marks the deadline path. `abortedStreams` counts response bodies still tracked at that deadline, including non-SSE bodies, but not alarm handlers or requests awaiting headers. `restartCommit` marks pending state committed during Supervisor reconstruction; those commits are not forced and have no recoverable active streams. If a persisted pending configuration has no timestamp, the row uses the commit time as its pending time.
+Reading status skips admission and update checks, so it never triggers an update. HEAD returns no response body. Other methods return 405.
+
+Rows contain `id`, `facet`, `oldHash`, `newHash`, `kind`, `pendingSince`, `swappedAt`, `forced`, `abortedStreams`, and `restartCommit`. The `kind` is `code` when the hash changes, including combined code/scope changes. A same-hash configuration commit has kind `scope`.
+
+Timestamps use epoch milliseconds. Subtract `pendingSince` from `swappedAt` for the drain duration. Replacing a pending target keeps the original pending time.
+
+`forced` marks a deadline swap. `abortedStreams` counts response bodies still tracked at that deadline, including non-SSE bodies. It excludes alarm handlers and requests still awaiting headers.
+
+`restartCommit` marks pending state committed during Supervisor reconstruction. Those commits are not forced. No active streams can be recovered. If the saved pending configuration has no timestamp, the row uses the commit time for `pendingSince`.
 
 ## Alarms Through the Supervisor
 
-Facets cannot own native alarms. The loader supplies `env.SCHEDULER`, an unscoped loopback service stub. Its `setAlarm(scope, time)`, `getAlarm(scope)`, and `deleteAlarm(scope)` methods receive `{ supervisorId, facet }` from the trusted facet. Each facet has one logical wake-up, and its typed queue multiplexes application timers onto it.
+Facets cannot own native alarms. They call the unscoped loopback stub `env.SCHEDULER` supplied by the loader. Its methods are `setAlarm(scope, time)`, `getAlarm(scope)`, and `deleteAlarm(scope)`. The trusted facet passes `{ supervisorId, facet }` as the scope. Each facet has one logical wake-up. Its typed queue uses that wake-up to run multiple application timers.
 
-The due time and a unique scheduling token live on each facet's registry row in the Supervisor's SQLite. The native alarm is armed for the minimum time across facets, or deleted when none remain. Outside delivery, updating a row and the native alarm share a transaction. During delivery, handlers update logical wake-ups and the Supervisor rearms after the loop; an overdue failed wake-up uses the existing native retry so its retry metadata is preserved. Neither a code/scope swap nor Supervisor reconstruction resets the schedule. `getAlarm()` reports the logical due time, even when the physical alarm was postponed for draining; while that delivery is executing it returns null unless the handler has scheduled a replacement. Tokens keep a handler's rearm safe even when it uses the same timestamp.
+Each facet's registry row in the Supervisor's SQLite stores a due time and a unique scheduling token. The Supervisor sets its native alarm to the earliest due time across facets. It deletes the alarm when no wake-ups remain. Outside delivery, it updates the row and native alarm in one transaction.
 
-When the native `Supervisor.alarm()` fires, it loads due facets serially without checking KV. Alarm-only traffic keeps current code until a request or socket message discovers a publication. One facet's RPC failure does not block the others; its row remains for native retry, and the first failure is rethrown after rearming. Pending drains postpone only old facets' wake-ups by two seconds without consuming the logical alarm or extending the hard drain timer. After swapping, the next delivery loads current code. Executing handlers gate only their own facet's code swap; scope changes drain them with other admitted work. A deadline abort rejects the old handler and leaves its durable alarm record for retry. Native alarm persistence and retries recover delivery across Supervisor restarts.
+During delivery, handlers update their logical wake-ups. The Supervisor rearms the native alarm after the delivery loop. If an overdue wake-up fails, it keeps the existing native retry and its metadata. Code swaps, scope changes, and Supervisor reconstruction leave the schedule intact.
 
-Cloudflare reserves `alarm` on Durable Object RPC stubs. A tiny `F.dispatchAlarm(info)` bridge therefore invokes `F.alarm(info)`. The Supervisor copies the runtime's non-serializable invocation metadata into a plain object, preserving the logical scheduled time and native retry information.
+`getAlarm()` reports the logical due time even if draining postpones the native alarm. While that delivery is executing, it returns null unless the handler has scheduled a replacement. A unique token distinguishes the replacement from the executing wake-up, even when both use the same timestamp.
 
-The facet's `Alarms` module stores typed JSON entries in SQLite, indexed by time. Scheduling and cancellation rearm the Supervisor for the earliest entry, or delete its wake-up when empty. Due entries run in time and insertion order. Successful entries are deleted; failures, including unknown types, retry independently with exponential backoff starting at one second and capped at one hour. After ten failed attempts an entry is dropped with an error log. Handlers may schedule more work; newly scheduled entries run on a subsequent wake-up.
+When `Supervisor.alarm()` fires, it loads due facets one at a time without checking KV. Alarm-only traffic keeps current code until a request or socket message discovers a publication. If one facet's RPC fails, the Supervisor still tries the others. It keeps the failed row for native retry, rearms the alarm, then rethrows the first failure.
 
-Delivery is at least once. Handlers must be idempotent because aborts and failures can repeat completed effects. Queue infrastructure errors propagate to Cloudflare's native retries; handler failures use the facet queue's retry schedule. Cancellation does not undo running work.
+During a pending drain, it postpones only old facets' wake-ups by two seconds. This neither consumes the logical alarm nor extends the drain deadline. After a swap, the next delivery loads current code.
 
-The demo's `GET/PUT/DELETE /u/<user>/alarm` exposes the queue. PUT accepts `{type,time,payload}` and returns `{id}`; types are `reminder` with `{text}` and `cleanup` with `{key}`. DELETE accepts `?id=`. GET returns `alarms`, persistent delivery `count`, and `last` with the handling code hash, type, and payload.
+An executing handler delays only its own facet's code swap. Scope changes wait for handlers along with other admitted work. A deadline abort rejects the old handler but keeps its durable alarm record for retry. Persisted native alarms and retries recover delivery across Supervisor restarts.
+
+Cloudflare reserves `alarm` on Durable Object RPC stubs, so the Supervisor calls `F.dispatchAlarm(info)`. That method invokes `F.alarm(info)`. The runtime's invocation metadata cannot be serialized directly. The Supervisor copies it into a plain object with the logical scheduled time and native retry information.
+
+The facet's `Alarms` module stores typed JSON entries in SQLite with a time index. Scheduling or cancelling an entry rearms the Supervisor for the earliest entry. An empty queue deletes its wake-up.
+
+Due entries run in time and insertion order. Success deletes the entry. Each failed entry retries independently, including entries with unknown types. Exponential backoff starts at one second and caps at one hour. After ten failed attempts, the queue drops the entry and logs an error. Handlers can schedule more work. New entries run on a later wake-up.
+
+Delivery is at least once. Aborts and failures can repeat completed effects, so handlers must be idempotent. Errors in the queue infrastructure reach Cloudflare's native retries. Handler failures use the facet queue's retry schedule. Cancellation does not undo running work.
+
+The demo exposes the queue at `GET/PUT/DELETE /u/<user>/alarm`. PUT accepts `{type,time,payload}` and returns `{id}`. The supported types are `reminder` with `{text}` and `cleanup` with `{key}`. DELETE accepts `?id=`. GET returns `alarms`, the persistent delivery `count`, and `last`. The last delivery includes the handling code hash, type, and payload.
+
+```mermaid
+sequenceDiagram
+  participant Q as Facet SQLite queue
+  participant L as Scheduler loopback
+  participant S as Supervisor
+  participant A as Native alarm
+  participant F as Facet handler
+  Q->>L: setAlarm(scope, earliest entry)
+  L->>S: Store facet due time and token
+  S->>A: Arm minimum across facets
+  A->>S: alarm(info)
+  loop Due facets in time and name order
+    alt Facet still needs swap
+      S->>S: Keep logical wake-up, defer physical delivery
+    else Facet can run
+      S->>F: dispatchAlarm(plain info)
+      F->>Q: Snapshot due entries in time and id order
+      Q->>Q: Run handlers and delete successes or back off failures
+      Q->>L: Rearm earliest entry or delete wake-up
+      L->>S: Update logical wake-up
+      F-->>S: Delivery complete
+      S->>S: Clear old token only if unchanged
+    end
+  end
+  S->>A: Rearm minimum or delete alarm
+  Note over S,A: Failed overdue delivery keeps native retry metadata
+```
 
 ## State and Forward-Only Changes
 
-Current and pending code/scope configurations are durable; active requests and the timer are not. There is no waiting-request queue. Persisting current before abort lets a restarted Supervisor select the intended code. A pending configuration recovered on wake is committed immediately because there is no recoverable inflight set to drain. A Supervisor crash can still lose open streams without a final abort event. Retry scheduling belongs to clients, not Supervisor memory.
+The Supervisor persists current and pending code/scope configurations. It cannot persist active requests or the timer, and it has no waiting-request queue. Saving current before abort lets a restarted Supervisor load the intended code.
 
-The typed alarm queue and handler effects belong to facet storage; the Supervisor stores only the next wake-up. Application state belongs in the facet's SQLite database. The demo writes a served counter before starting each stream, once per stream rather than once per event. The counter survives code replacement.
+On wake, it commits any recovered pending configuration immediately because there is no recoverable inflight work to drain. A crash can still drop open streams without a final abort event. Clients schedule their own retries.
 
-For a real long-running application, the **facet itself** must checkpoint meaningful work periodically. The Supervisor does not provide automatic checkpoints. This demo persists its counter, but does not implement resumable stream checkpoints or a migration framework. Application migrations should be repeatable and compatible with forward-only updates.
+The facet stores its typed alarm queue and handler effects. The Supervisor stores only the next wake-up. Application state lives in the facet's SQLite database. The demo increments a served counter before each stream starts. It increments once per stream, not per event. The counter survives code replacement.
 
-There is no rollback or canary path. A faulty release is corrected by publishing another version. The Supervisor enforces monotonically increasing publication generations, not ordered content hashes. Deliberately publishing an older hash with a newer generation is allowed. Each publish reads the generation in KV `latest` and writes `max(now, previous + 1)`, so stalled/regressing clocks and interrupted publishes still advance it. Use one serialized deploy writer sharing the same Alchemy state; independent state stores or lost deployment state cannot guarantee global ordering.
+A long-running app must periodically checkpoint its work in the **facet itself**. The Supervisor does not do this automatically. The demo saves its counter but has no resumable stream checkpoints or migration framework. Application migrations should be repeatable and work with forward-only updates.
+
+There is no rollback or canary path. To fix a faulty release, publish another version. The Supervisor requires increasing publication generations. Hashes have no order, so an older hash can be published with a newer generation.
+
+Each publish reads the generation in KV `latest` and writes `max(now, previous + 1)`. The generation advances even if the clock stalls or moves backward, or a publish is interrupted. Use one serialized deploy writer with shared Alchemy state. Independent state stores or lost deployment state cannot guarantee global ordering.
 
 ## Limits and Safety
 
-Keep both runtime servers on loopback and do not tunnel them. Only trusted local code should publish facets. The dynamic worker environment contains its hash and unscoped Notes/scheduler forwarding stubs; each trusted facet receives identity and permissions through plain class props. Neither receives raw R2, KV, or namespace bindings, and the worker has `globalOutbound = null`. These restrictions do not make this prototype a hardened multi-tenant sandbox.
+Keep both runtime servers on loopback. Do not tunnel them. Only trusted local code should publish facets.
 
-Actions diff inputs rather than checking for storage drift. Deleting emulator data independently of Alchemy state requires a forced reconciliation. Old R2 code objects are retained for Supervisors that have not updated.
+The dynamic worker environment contains its hash and unscoped Notes/scheduler forwarding stubs. Each trusted facet gets identity and permissions through plain class props. Neither receives raw R2, KV, or namespace bindings. The worker has `globalOutbound = null`. These restrictions are insufficient for a hardened multi-tenant sandbox.
 
-Local KV does not reproduce production propagation delay. Crash-safe request recovery, production authentication, source-map publication, billing validation, and production rollout are outside this prototype. Preflight failures retain the current code. Errors after a successful swap still propagate; there is no automatic runtime rollback.
+Actions compare inputs with saved state. They do not check whether storage has changed independently. If emulator data is deleted without updating Alchemy state, force reconciliation. Old R2 code objects stay available for Supervisors that have not updated.
+
+Local KV does not reproduce production propagation delay. It does not cover crash-safe request recovery or production authentication. Source-map publication and billing validation are not implemented.
+
+If preflight fails, current code keeps serving. Errors after a successful swap still reach the runtime. There is no automatic rollback.
