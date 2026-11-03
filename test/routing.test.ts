@@ -55,8 +55,13 @@ function facet() {
     HASH: "1234567890abcdef",
   };
   const services = {
-    versions: { latest: async () => null },
-    swap: { pending: async () => false, ready: async () => {} },
+    versions: {
+      latest: vi.fn<() => Promise<{ hash: string; generation: number } | null>>(async () => null),
+    },
+    swap: {
+      pending: vi.fn<() => Promise<boolean>>(async () => false),
+      ready: vi.fn<() => Promise<void>>(async () => {}),
+    },
     notes: {
       get: vi.fn<(scope: unknown, key: string) => Promise<string>>(async (_scope, key) => key),
       put: vi.fn<(scope: unknown, key: string, value: string) => Promise<void>>(async () => {}),
@@ -80,6 +85,8 @@ function facet() {
     // The unit harness implements only the storage and RPC surface exercised here.
     {
       props,
+      getWebSockets: () => [],
+      waitUntil: () => {},
       storage: {
         sql: {
           exec: (query: string, ...bindings: (string | number | null)[]) => {
@@ -339,4 +346,16 @@ test("unknown alarm types retry and drop after ten failures", async () => {
   } finally {
     error.mockRestore();
   }
+});
+
+test("update rejection waits for its response body before declaring the facet ready", async () => {
+  const h = facet();
+  h.props.versions.latest.mockResolvedValue({ hash: "next", generation: 1 });
+  h.props.swap.pending.mockResolvedValue(true);
+  const response = await h.fetch("/version");
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("X-Pending-Version"), "next");
+  assert.equal(h.props.swap.ready.mock.calls.length, 0);
+  assert.equal(await response.text(), "Update pending; retry later");
+  assert.equal(h.props.swap.ready.mock.calls.length, 1);
 });

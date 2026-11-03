@@ -4,11 +4,11 @@ import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 
 import * as Cloudflare from "@alchemy.run/cloudflare";
+import * as Test from "@alchemy.run/test/Vitest";
 import * as Alchemy from "alchemy";
 import { toFqn } from "alchemy/FQN";
 import { CurrentNamespace } from "alchemy/Namespace";
 import { State } from "alchemy/State";
-import * as Test from "alchemy/Test/Vitest";
 import * as Effect from "effect/Effect";
 import { vi } from "vitest";
 
@@ -168,7 +168,7 @@ test.provider(
       const context = yield* Effect.context();
       const deploy = async (version: string, gatewayRevision?: string) => {
         const result = await Effect.runPromiseWith(context)(
-          // Alchemy beta.84 exposes a broad deployment error channel.
+          // Alchemy exposes a broad deployment error channel.
           // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context
           stack.deploy(resources(version, gatewayRevision)),
         );
@@ -437,19 +437,16 @@ test.provider(
         }
         pass("facet reads/writes its own scope; other-user and traversal keys cannot escape");
 
-        // Alchemy keeps Api alive, but its local service channel still pins the old Gateway.
-        // Record this local-provider limitation rather than claim a transparent refresh.
+        // Gateway replacement refreshes the binding without interrupting Api streams.
         const duringGateway = stream(a, 25, 100);
         await duringGateway.started;
         assert.equal(await deploy("v3", "g2"), v3);
         assert.deepEqual(await (await note(a, "secret")).json(), {
           value: "alice only",
-          gateway: "g1",
+          gateway: "g2",
         });
         assert.equal((await duringGateway.done).events.length, 25);
-        pass(
-          "gateway redeploy preserves live stream; local binding stays on g1 (known limitation)",
-        );
+        pass("gateway redeploy preserves live stream and refreshes the local binding");
 
         const drainingScope = stream(a, 12, 100);
         await drainingScope.started;
@@ -633,7 +630,7 @@ test.provider(
         const nextBundle = await Effect.runPromiseWith(context)(bundleFacet("preflight-next"));
         const inject = async (hash: string, generation: number, code: string | null = null) => {
           await Effect.runPromiseWith(context)(
-            // Alchemy beta.84 exposes a broad deployment error channel.
+            // Alchemy exposes a broad deployment error channel.
             // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context
             stack.deploy(
               Effect.gen(function* () {

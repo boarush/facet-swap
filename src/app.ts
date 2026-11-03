@@ -208,19 +208,18 @@ export class App extends DurableObject<AppEnv, AppProps> {
     const release = this.beginWork();
     try {
       await this.updates.check();
-      if (this.updating) {
-        release();
-        return new Response("Update pending; retry later", {
-          status: 503,
-          headers: {
-            "Retry-After": "1",
-            "X-Current-Version": this.env.HASH,
-            "X-Pending-Version": this.updating,
-            "Cache-Control": "no-store",
-          },
-        });
-      }
-      const response = await this.router.fetch(request, this.env);
+      // Even an update rejection is work until its response body leaves the facet.
+      const response = this.updating
+        ? new Response("Update pending; retry later", {
+            status: 503,
+            headers: {
+              "Retry-After": "1",
+              "X-Current-Version": this.env.HASH,
+              "X-Pending-Version": this.updating,
+              "Cache-Control": "no-store",
+            },
+          })
+        : await this.router.fetch(request, this.env);
       if (response.status === 101) {
         release();
         return response;
