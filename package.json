@@ -25,21 +25,24 @@
     "@effect/platform-node": "4.1.2",
     "alchemy": "2.0.0-beta.85",
     "effect": "4.1.2",
-    "hono": "^4.13.13"
+    "hono": "^4.13.17"
   },
   "devDependencies": {
     "@alchemy.run/test": "2.0.0-beta.85",
     "@changesets/cli": "^3.0.3",
-    "@cloudflare/workers-types": "5.20261026.1",
-    "@effect/tsgo": "0.53.5",
+    "@cloudflare/workers-types": "5.20261108.1",
+    "@effect/tsgo": "0.67.5",
     "@effect/vitest": "4.1.2",
-    "oxfmt": "^0.74.0",
-    "oxlint": "1.88.0",
-    "oxlint-tsgolint": "7.0.2004",
+    "oxfmt": "^0.77.0",
+    "oxlint": "1.92.0",
+    "oxlint-tsgolint": "7.0.2006",
     "typescript": "7.0.2",
-    "vitest": "^5.0.5"
+    "vitest": "^5.1.0"
   },
   "engines": {
     "node": "^24.11.1 || >=25.1.0"
+  },
+  "allowScripts": {
+    "workerd@1.20261026.1": true
   }
 }
