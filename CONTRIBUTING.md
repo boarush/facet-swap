@@ -11,7 +11,7 @@ Small docs or tooling fixes can go straight to `master`.
 A branch that changes runtime behavior or an API includes one changeset:
 
 ```sh
-npx changeset --patch facet-swap -m "Describe the change"
+pnpm changeset --patch facet-swap -m "Describe the change"
 ```
 
 Use `--patch` for fixes and `--minor` for features and breaking changes until 1.0. Docs, tests, and dev tooling need none.
@@ -22,4 +22,4 @@ Design proposals live in `rfcs/` as numbered files (`0001-short-name.md`) with a
 
 ## Before Committing
 
-`npm run test:quick` is enough while iterating. Before committing, run `npm run check`, `npm run lint`, `npm run fmt:check`, and the full `npm test`.
+`pnpm test:quick` is enough while iterating. Before committing, run `pnpm check`, `pnpm lint`, `pnpm fmt:check`, and the full `pnpm test`.

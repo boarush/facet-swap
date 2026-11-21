@@ -41,8 +41,5 @@
   },
   "engines": {
     "node": "^24.11.1 || >=25.1.0"
-  },
-  "allowScripts": {
-    "workerd@1.20261026.1": true
   }
 }

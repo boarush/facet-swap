@@ -139,7 +139,7 @@ Editing application source changes the hash without a label bump. Changing the o
 
 ```mermaid
 flowchart TD
-  CLI["npm run dev:refresh"] --> TRIGGER[Change stack reconciliation trigger]
+  CLI["pnpm dev:refresh"] --> TRIGGER[Change stack reconciliation trigger]
   SALT["Optional argument or edit to facet-version.ts"] --> LABEL[Set manual salt]
   LABEL --> EVAL[Alchemy dev reconciles stack]
   TRIGGER --> EVAL

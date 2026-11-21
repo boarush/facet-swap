@@ -4,7 +4,7 @@
   "tabWidth": 2,
   "semi": true,
   "singleQuote": false,
-  "ignorePatterns": [".alchemy/**", "audit.json", "package-lock.json", "facet-version.ts"],
+  "ignorePatterns": [".alchemy/**", "audit.json", "pnpm-lock.yaml", "facet-version.ts"],
   "sortImports": {
     "groups": [
       ["type-builtin", "value-builtin"],
