@@ -1,7 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 
 import { Alarms } from "./alarms";
+import type { ClientMsg, ServerEvent } from "./contract";
 import { isDenied, type NotesScope, type ScopedNotes } from "./notes";
+import {
+  codecFor,
+  latest,
+  LATEST,
+  negotiate,
+  supportedVersions,
+  type VersionCodec,
+} from "./protocol";
 import { createRouter } from "./router";
 import type { Scheduler } from "./scheduler";
 import { trackResponseBody } from "./stream-lifetime";
@@ -37,7 +46,7 @@ export class App extends DurableObject<AppEnv, AppProps> {
   private onUpdate(hash: string): void {
     this.updating = hash;
     for (const socket of this.ctx.getWebSockets()) {
-      socket.send(JSON.stringify({ type: "swap-pending", hash }));
+      this.sendEvent(socket, { type: "swap-pending", hash });
     }
     this.readyWhenIdle();
   }
@@ -61,15 +70,64 @@ export class App extends DurableObject<AppEnv, AppProps> {
     const release = this.beginWork();
     try {
       await this.updates.check();
-      socket.send(
-        JSON.stringify({
-          hash: this.env.HASH,
-          message: typeof message === "string" ? message : Array.from(new Uint8Array(message)),
-        }),
-      );
+      // Every inbound message is validated at this edge before the core sees it.
+      let parsed: unknown;
+      try {
+        if (typeof message !== "string") throw new Error("binary frame");
+        parsed = JSON.parse(message);
+      } catch {
+        socket.close(1003, "Invalid message");
+        return;
+      }
+      const clientMessage = this.codecForSocket(socket).decodeClient(parsed);
+      if (clientMessage === null) {
+        socket.close(1003, "Message failed schema validation");
+        return;
+      }
+      await this.handleClientMessage(socket, clientMessage);
     } finally {
       release();
     }
+  }
+
+  private codecForSocket(socket: WebSocket): VersionCodec {
+    // Hibernation can evict this facet between messages, so the negotiated
+    // version travels in the socket attachment, not facet memory.
+    const version = (socket.deserializeAttachment() as { v: number } | null)?.v;
+    return codecFor(version ?? LATEST) ?? latest;
+  }
+
+  private sendEvent(socket: WebSocket, event: ServerEvent): void {
+    const codec = this.codecForSocket(socket);
+    const outcome = codec.downgrade(event);
+    if (outcome.kind === "skip") return;
+    if (outcome.kind === "close") {
+      // Silently skipping would leave an older client wrong; it must update.
+      socket.close(outcome.code, outcome.reason);
+      return;
+    }
+    socket.send(codec.encodeEvent(outcome.event));
+  }
+
+  // The core speaks only the latest contract; adapters translated at the edge.
+  private async handleClientMessage(socket: WebSocket, message: ClientMsg): Promise<void> {
+    if (message.type !== "note.put") return;
+    try {
+      await this.env.NOTES.put(this.ctx.props, message.key, message.value);
+    } catch (error) {
+      // Only scope denials are conflicts; gateway or storage failures propagate.
+      if (!isDenied(error)) throw error;
+      this.sendEvent(socket, { type: "note.conflict", key: message.key });
+      return;
+    }
+    // A per-note revision in facet storage; it survives code swaps.
+    const key = "note-rev:" + message.key;
+    const revision = this.ctx.storage.transactionSync(() => {
+      const next = (this.ctx.storage.kv.get<number>(key) ?? 0) + 1;
+      this.ctx.storage.kv.put(key, next);
+      return next;
+    });
+    this.sendEvent(socket, { type: "note.saved", key: message.key, revision });
   }
 
   webSocketClose(socket: WebSocket, code: number, reason: string): void {
@@ -111,9 +169,18 @@ export class App extends DurableObject<AppEnv, AppProps> {
     .get("/ws", (c) => {
       if (c.req.header("Upgrade")?.toLowerCase() !== "websocket")
         return new Response("Expected WebSocket", { status: 426 });
+      // A version is required and checked before the socket exists; a
+      // connection never changes it.
+      const version = negotiate(c.req.query("v"));
+      if (version === null)
+        return Response.json(
+          { error: "A supported ?v= protocol version is required", supported: supportedVersions() },
+          { status: 426, headers: { "Cache-Control": "no-store" } },
+        );
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
-      pair[1].send(JSON.stringify({ type: "swap-resumed", hash: this.env.HASH }));
+      pair[1].serializeAttachment({ v: version });
+      this.sendEvent(pair[1], { type: "swap-resumed", hash: this.env.HASH });
       return new Response(null, { status: 101, webSocket: pair[0] });
     })
     .all("/ws", () => new Response("Method not allowed", { status: 405 }))

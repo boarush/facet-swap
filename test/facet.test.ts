@@ -185,26 +185,34 @@ test.provider(
         pass("no manual label needed; clients see a short content hash");
 
         const socketUser = "socket_" + process.pid;
-        const socket = new WebSocket(base.replace("http:", "ws:") + "/u/" + socketUser + "/ws");
-        const messages: { type?: string; hash: string; message?: string }[] = [];
-        socket.addEventListener("message", (event) =>
-          messages.push(JSON.parse(String(event.data))),
-        );
-        await new Promise<void>((resolve, reject) => {
-          socket.addEventListener("open", () => resolve(), { once: true });
-          socket.addEventListener("error", reject, { once: true });
-        });
+        const wsUrl = base.replace("http:", "ws:") + "/u/" + socketUser + "/ws";
+        const collect = (socket: WebSocket) => {
+          const messages: Record<string, unknown>[] = [];
+          socket.addEventListener("message", (event) =>
+            messages.push(JSON.parse(String(event.data))),
+          );
+          return messages;
+        };
+        const opened = (socket: WebSocket) =>
+          new Promise<void>((resolve, reject) => {
+            socket.addEventListener("open", () => resolve(), { once: true });
+            socket.addEventListener("error", reject, { once: true });
+          });
+        // A version is required; ?v=2 is the latest contract.
+        const socket = new WebSocket(wsUrl + "?v=2");
+        const messages = collect(socket);
+        await opened(socket);
         await until(async () => messages.length === 1);
         assert.deepEqual(messages[0], { type: "swap-resumed", hash: unlabelled });
-        socket.send("hello");
+        socket.send(JSON.stringify({ type: "note.put", key: "note", value: "hello" }));
         await until(async () => messages.length === 2);
-        assert.deepEqual(messages[1], { hash: unlabelled, message: "hello" });
+        assert.deepEqual(messages[1], { type: "note.saved", key: "note", revision: 1 });
         assert.equal((await get<Status>("/u/" + socketUser + "/__status")).inflight, 0);
         const closed = new Promise<number>((resolve) =>
           socket.addEventListener("close", (event) => resolve(event.code), { once: true }),
         );
         const socketHash = await deploy("socket-next");
-        socket.send("detect");
+        socket.send(JSON.stringify({ type: "note.put", key: "note", value: "detect" }));
         const closeCode = await Promise.race([
           closed,
           delay(10000).then(() => {
@@ -221,22 +229,39 @@ test.provider(
           (await get<Status>("/u/" + socketUser + "/__status")).current!.hash,
           socketHash,
         );
-        const reconnected = new WebSocket(
-          base.replace("http:", "ws:") + "/u/" + socketUser + "/ws",
-        );
-        const resumed = await new Promise<{ hash: string }>((resolve, reject) => {
-          reconnected.addEventListener(
-            "message",
-            (event) => resolve(JSON.parse(String(event.data))),
-            { once: true },
-          );
-          reconnected.addEventListener("error", reject, { once: true });
-        });
-        assert.equal(resumed.hash, socketHash);
+        // A v1 client negotiates ?v=1 and sees only v1 shapes on one core.
+        const legacy = new WebSocket(wsUrl + "?v=1");
+        const legacyMessages = collect(legacy);
+        await opened(legacy);
+        await until(async () => legacyMessages.length === 1);
+        assert.deepEqual(legacyMessages[0], { type: "swap-resumed", hash: socketHash });
+        legacy.send(JSON.stringify({ type: "note.put", key: "legacy", text: "old client" }));
+        await until(async () => legacyMessages.length === 2);
+        // v1 note.saved carries no revision; the adapter dropped it.
+        assert.deepEqual(legacyMessages[1], { type: "note.saved", key: "legacy" });
+        legacy.close();
+        // Unsupported and missing versions never complete the upgrade.
+        const refused = async (url: string) => {
+          const socket = new WebSocket(url);
+          await new Promise<void>((resolve, reject) => {
+            socket.addEventListener("open", () => reject(new Error(url + " opened")), {
+              once: true,
+            });
+            socket.addEventListener("error", () => resolve(), { once: true });
+            socket.addEventListener("close", () => resolve(), { once: true });
+          });
+        };
+        await refused(wsUrl + "?v=9");
+        await refused(wsUrl);
+        const reconnected = new WebSocket(wsUrl + "?v=2");
+        const resumedMessages = collect(reconnected);
+        await opened(reconnected);
+        await until(async () => resumedMessages.length === 1);
+        assert.deepEqual(resumedMessages[0], { type: "swap-resumed", hash: socketHash });
         reconnected.close();
         await deploy("");
         pass(
-          "socket passthrough echoes, detects updates, closes with 1012 and reconnects on new code",
+          "sockets require a version at connect; v1 and v2 clients share one core and reconnect after swaps",
         );
 
         const diagnosticUser = "/u/unlabelled_" + process.pid;
@@ -477,7 +502,7 @@ test.provider(
         await scope(a, false);
         assert.equal((await note(a, "secret", "alice writable again")).status, 200);
         pass("same-version scope swap drains before read-only enforcement; other users unaffected");
-        const forcedSocket = new WebSocket(base.replace("http:", "ws:") + "/u/" + a + "/ws");
+        const forcedSocket = new WebSocket(base.replace("http:", "ws:") + "/u/" + a + "/ws?v=2");
         await new Promise<void>((resolve, reject) => {
           forcedSocket.addEventListener("message", () => resolve(), { once: true });
           forcedSocket.addEventListener("error", reject, { once: true });

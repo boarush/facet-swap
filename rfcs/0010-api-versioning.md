@@ -1,6 +1,6 @@
 # RFC 0010: API Versioning and Contract Boundary
 
-- **Status:** Draft
+- **Status:** Draft — demo implementation on `rfc/0010-api-versioning`
 - **Created:** 2026-10-28
 
 ## Summary
@@ -17,7 +17,7 @@ Clients negotiate a protocol version once, at connect time. The application core
 
 ### Negotiation
 
-The client requests a version in the handshake (`Sec-WebSocket-Protocol` or a query parameter) and the server echoes the one it accepts. A connection never changes version. Swaps close sockets, so clients renegotiate on reconnect.
+The client requests a version as a query parameter (`?v=1`) on the handshake URL. There is no default: a client without a version, or with a version this server no longer speaks, has its upgrade rejected. A connection never changes version. Swaps close sockets, so clients renegotiate on reconnect. A `Sec-WebSocket-Protocol` header would carry the same per-connection choice, but proxies mangle it and strict clients reject an echoed value they did not offer, so negotiation stays in the URL and the 101 response stays untouched.
 
 ### Contract
 
@@ -72,7 +72,7 @@ export const downgrade = (e: V2.ServerEvent): Downgraded<V1.ServerEvent> => {
 };
 ```
 
-A v1 socket negotiates `Sec-WebSocket-Protocol: facet.v1`. Each inbound message is decoded with the v1 schema, upgraded, and handled by the core. Each outbound event is downgraded, then encoded with the v1 schema or skipped, or the socket is closed.
+A v1 socket negotiates `?v=1`. Each inbound message is decoded with the v1 schema, upgraded, and handled by the core. Each outbound event is downgraded, then encoded with the v1 schema or skipped, or the socket is closed.
 
 ### Support window
 

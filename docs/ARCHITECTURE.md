@@ -253,7 +253,11 @@ The facet accepts hibernatable sockets with `ctx.acceptWebSocket()` and handles 
 
 Aborting a facet does not close hibernated sockets in production. Before calling `swap.ready()`, the framework closes each socket with code 1012 (`service restart`). For deadline, scope-change, and restart swaps, the Supervisor calls the facet's `closeSockets()` RPC first. It allows one second per facet and aborts even if closing fails. Clients must reconnect and retry. An open socket alone never delays replacement.
 
-`/u/<user>/ws` is a small echo demo. The initial `swap-resumed` frame and each echo include the serving hash. The update hook sends `swap-pending` before declaring readiness. The app handles its own buffering, protocol negotiation, and recovery.
+`/u/<user>/ws` speaks the versioned contract from [RFC 0010](../rfcs/0010-api-versioning.md). A client negotiates once at connect through the `?v=1` query parameter; the 101 response stays untouched. A version is required and is checked before the upgrade completes: a client without one, or with a version this code no longer speaks, fails the upgrade with 426 and the supported list in the body. There is no unversioned escape hatch. A `Sec-WebSocket-Protocol` header would carry the same per-connection choice, but proxies mangle it and strict clients reject a value they did not offer, so negotiation stays in the URL. The negotiated version travels in the socket's hibernation attachment, so it survives eviction.
+
+Inbound frames are validated against the negotiated version's schema and upgraded to the latest contract, the only shape the core sees. Outbound events are downgraded by pure adapters: translated, skipped, or, when an older client would otherwise be wrong, closed with 4426. `note.put` stores through the Notes capability and replies `note.saved` with a per-note revision kept in facet storage; a refused write emits the informational `note.conflict`, which v1 clients skip. `notes.reset` has no live trigger in the demo and exists to exercise the Close outcome. A new latest event type fails the type check in each adapter's `downgrade` until a reviewer picks an outcome for it.
+
+The update hook sends `swap-pending` before declaring readiness. The app handles its own buffering and recovery; the core never sees a version number.
 
 ```mermaid
 sequenceDiagram
